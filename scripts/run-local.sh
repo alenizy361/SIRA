@@ -82,12 +82,38 @@ fi
 # ---------------------------------------------------------------------------
 say "4/5 Making it survive reboots"
 # ---------------------------------------------------------------------------
+# A previous run of THIS script that failed partway (e.g. at the Docker or
+# image-build step, before a fix like the ones already applied to install.sh)
+# stops before ever reaching install_systemd_units - so on this machine the
+# unit file may genuinely not exist yet. `systemctl enable` on a missing unit
+# fails with a generic error that looks identical to "exists but disabled",
+# which sent operators straight to `claude auth login` + restart, only to hit
+# a confusing "Unit rabit-claude-worker.service not found." Check for that
+# distinct case up front and say so plainly, since it needs a different fix
+# (re-run this whole script) than a unit that exists but won't start.
+INSTALL_INCOMPLETE=0
 for unit in rabit-api.service rabit-web.service rabit-claude-worker.service; do
+  if [[ ! -f "/etc/systemd/system/${unit}" ]]; then
+    bad "${unit} was never installed - this run of install.sh did not reach that step."
+    INSTALL_INCOMPLETE=1
+    continue
+  fi
   systemctl enable "$unit" >/dev/null 2>&1 && ok "$unit will start at boot" \
     || warn "Could not enable $unit at boot"
 done
 # Docker must come back on its own too, or nothing else can.
 systemctl enable docker >/dev/null 2>&1 || true
+
+if [[ "$INSTALL_INCOMPLETE" -eq 1 ]]; then
+  echo ""
+  bad "The install did not finish, so the background service was never created."
+  echo "     This should not happen given install.sh returned success above - if you"
+  echo "     see this, please report it. For now, just re-run this exact command:"
+  echo ""
+  echo "     curl -fsSL https://raw.githubusercontent.com/alenizy361/SIRA/${BRANCH}/scripts/run-local.sh | sudo bash"
+  echo ""
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 say "5/5 Status"
