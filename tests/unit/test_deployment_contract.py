@@ -208,3 +208,35 @@ def test_installer_never_rewrites_a_valid_env(tmp_path):
         "REDIS_URL=redis://cache.internal:6379/3\n"
     )
     assert _run_repair_env(tmp_path, original) == original
+
+
+def test_installer_verifies_docker_daemon_not_just_the_package():
+    """Regression: `systemctl enable --now docker || true` silently swallowed a
+    daemon that never actually started, so install.sh barreled ahead for a
+    dozen more steps and only failed much later at `docker compose up` with
+    "Cannot connect to the Docker daemon" - a real reported symptom that gave
+    no hint the actual cause was here. The installer must probe the daemon
+    itself (docker info) right after enabling it, not just trust the unit
+    "enabled" state."""
+    install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text()
+    assert "wait_for_docker_daemon" in install_sh, (
+        "install_docker no longer verifies the daemon actually answers before continuing"
+    )
+    assert re.search(r"docker info", install_sh), (
+        "no `docker info` probe found - the installer can't tell an enabled unit from a dead daemon"
+    )
+
+
+def test_installer_auto_installs_the_claude_cli():
+    """Regression: a fresh host needed a SECOND manual command
+    (npm install -g @anthropic-ai/claude-code) before the worker could even
+    attempt `claude auth login`. Node is already installed by this same
+    script and a global npm install needs no interaction, so only the
+    interactive login itself should remain manual."""
+    install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text()
+    assert "install_claude_cli" in install_sh
+    assert "npm install -g @anthropic-ai/claude-code" in install_sh
+    # Must actually be called from the main install path, not just defined.
+    assert re.search(r"^\s*install_claude_cli\s*$", install_sh, re.MULTILINE), (
+        "install_claude_cli is defined but never invoked from main()"
+    )

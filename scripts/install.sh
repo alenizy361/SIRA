@@ -138,6 +138,7 @@ install_docker() {
     fi
   fi
   systemctl_or_service_enable docker
+  wait_for_docker_daemon
 
   if docker compose version >/dev/null 2>&1; then
     log_ok "docker compose plugin already present"
@@ -178,6 +179,38 @@ systemctl_or_service_enable() {
   fi
 }
 
+# `systemctl enable --now docker || true` swallows every failure - a package
+# that installed fine but whose daemon didn't actually come up (cgroup driver
+# mismatch, a conflicting prior Docker install, a socket permission issue,
+# anything) was silently treated as success. The script then barreled ahead
+# for a dozen more steps and finally failed at `docker compose up` with
+# "Cannot connect to the Docker daemon" - a real, reported symptom that gave no
+# hint the actual problem was here. Verify the daemon genuinely answers before
+# trusting it, and if it doesn't, fail LOUDLY with the real reason attached
+# instead of a confusing error many steps later.
+wait_for_docker_daemon() {
+  local tries=0
+  while ! docker info >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [[ "$tries" -ge 10 ]]; then
+      log_warn "Docker daemon not responding yet after ${tries}s - trying an explicit start."
+      systemctl start docker 2>/dev/null || true
+      sleep 3
+      if docker info >/dev/null 2>&1; then
+        break
+      fi
+      echo "---- systemctl status docker ----"
+      systemctl status docker --no-pager -l 2>&1 | tail -20
+      echo "---- journalctl -u docker (last 30 lines) ----"
+      journalctl -u docker -n 30 --no-pager 2>&1 | tail -30
+      echo "----------------------------------"
+      die "Docker is installed but its daemon is not reachable (see the real error above). Fix that, then re-run this installer."
+    fi
+    sleep 1
+  done
+  log_ok "Docker daemon is up and reachable"
+}
+
 install_nodejs() {
   if command -v node >/dev/null 2>&1; then
     local ver major
@@ -195,6 +228,32 @@ install_nodejs() {
   rm -f /tmp/nodesource_setup.sh
   apt-get install -y nodejs
   log_ok "Installed $(node --version)"
+}
+
+# Node is already provisioned right above this function, and `npm install -g`
+# needs no interaction - only `claude auth login` (a browser device-flow login
+# tied to the aicompany OS user) genuinely cannot be scripted. Installing the
+# CLI itself was previously left as a manual step too ("Install it for that
+# user (npm install -g @anthropic-ai/claude-code)..."), which meant a fresh
+# host always needed a second command before the worker could even attempt to
+# authenticate. A global npm install lands its symlink in a directory already
+# on every user's PATH (including aicompany's), so this is the last thing that
+# can be automated before the one truly manual step.
+install_claude_cli() {
+  if command -v claude >/dev/null 2>&1; then
+    log_ok "Claude Code CLI already installed ($(claude --version 2>/dev/null || echo unknown))"
+    return
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    log_warn "npm not available — cannot auto-install the Claude Code CLI. Install Node.js first, then: npm install -g @anthropic-ai/claude-code"
+    return
+  fi
+  log_step "Installing Claude Code CLI (npm install -g @anthropic-ai/claude-code)"
+  if npm install -g @anthropic-ai/claude-code >/dev/null 2>&1; then
+    log_ok "Installed claude CLI ($(claude --version 2>/dev/null || echo unknown))"
+  else
+    log_warn "Could not install the Claude Code CLI automatically. Install it manually: npm install -g @anthropic-ai/claude-code"
+  fi
 }
 
 install_python311() {
@@ -228,6 +287,7 @@ install_apt_packages() {
 
   install_docker
   install_nodejs
+  install_claude_cli
   install_python311
 }
 
