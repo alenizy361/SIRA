@@ -179,7 +179,7 @@ install_python311() {
 install_apt_packages() {
   log_step "Checking base apt packages"
   apt_update_once
-  local pkgs=(nginx postgresql-client redis-tools gettext-base curl ca-certificates gnupg openssl)
+  local pkgs=(nginx postgresql-client redis-tools gettext-base curl ca-certificates gnupg openssl rsync)
   local missing=()
   for p in "${pkgs[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
