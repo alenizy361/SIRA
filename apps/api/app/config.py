@@ -79,4 +79,11 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    try:
+        return Settings()
+    except PermissionError:
+        # Final safety net for the host worker: if a .env becomes unreadable
+        # between import and construction (or cwd differs from where the
+        # readability probe ran), never take the whole process down - systemd's
+        # EnvironmentFile= has already injected every value we need.
+        return Settings(_env_file=None)

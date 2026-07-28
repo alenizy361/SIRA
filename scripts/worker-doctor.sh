@@ -152,10 +152,31 @@ if [[ "$NEED_LOGIN" -eq 1 ]]; then
   exit 1
 fi
 
-systemctl restart "$UNIT" 2>/dev/null && ok "Worker restarted for a fresh poll tick" || true
+# Clear systemd's start-rate latch BEFORE restarting. The unit is
+# Restart=on-failure with StartLimitBurst=10/StartLimitIntervalSec=600, so once
+# it has crash-looped systemd refuses further starts ("start request repeated
+# too quickly") until the failure state is reset. Without this, a restart here
+# silently does nothing and the worker stays dead even after its bug is fixed.
+systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+systemctl restart "$UNIT" 2>/dev/null || true
+
+# Verify it is genuinely UP a few seconds later - a unit that dies immediately
+# after start looks identical to a healthy one at restart time.
+sleep 3
+if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
+  ok "Worker is running (restarted for a fresh poll tick)"
+else
+  bad "Worker is STILL not running after restart. Its own log says why:"
+  echo "---- last 25 log lines ----"
+  journalctl -u "$UNIT" -n 25 --no-pager 2>/dev/null | tail -25
+  echo "---------------------------"
+  PROBLEMS=$((PROBLEMS+1))
+fi
 
 if [[ "$PROBLEMS" -eq 0 ]]; then
   ok "All checks passed — pending goals should start planning within ~5s."
+  echo "     Confirm from your browser:"
+  echo "       curl -s http://<this-server-public-ip>/api/health/worker"
   echo "     Watch it live:  journalctl -u ${UNIT} -f"
 else
   warn "${PROBLEMS} problem(s) found above — fix those, then re-run this script."

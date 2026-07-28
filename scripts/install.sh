@@ -560,8 +560,24 @@ install_systemd_units() {
   systemctl restart rabit-api.service
   systemctl restart rabit-web.service
   systemctl enable rabit-claude-worker.service >/dev/null 2>&1 || true
+  # CLEAR THE START-RATE LIMIT FIRST. The unit is Restart=on-failure with
+  # StartLimitBurst=10/StartLimitIntervalSec=600, so a unit that crash-looped
+  # (e.g. before `claude auth login`, or on an older buggy build) is left in a
+  # rate-limited "failed" state where systemd REFUSES a plain restart with
+  # "start request repeated too quickly". Deploying the fix then looks like it
+  # did nothing: new code on disk, worker still dead. reset-failed clears that
+  # latch so the freshly deployed code actually gets a chance to run.
+  systemctl reset-failed rabit-claude-worker.service >/dev/null 2>&1 || true
   if ! systemctl restart rabit-claude-worker.service; then
     log_warn "rabit-claude-worker.service did not start cleanly. This is expected if 'claude auth login' has not been run yet as ${AICOMPANY_USER} — see the manual step printed at the end of this script."
+  fi
+  # Report what actually happened rather than assuming: a unit that dies a
+  # second later is indistinguishable from a healthy one at restart time.
+  sleep 2
+  if systemctl is-active --quiet rabit-claude-worker.service; then
+    log_ok "rabit-claude-worker.service is running."
+  else
+    log_warn "rabit-claude-worker.service is NOT running. Diagnose with: journalctl -u rabit-claude-worker.service -n 30 --no-pager"
   fi
 }
 
