@@ -168,6 +168,9 @@ export interface PlanTask {
   agent_key: string | null;
   risk_level: string;
   state: string;
+  /** What the agent actually reported after its run - the real "what did it
+   *  do", not just a state label. Null until a run has produced output. */
+  result: string | null;
 }
 
 export interface GoalPlan {
@@ -180,6 +183,8 @@ export interface GoalPlan {
   tasks: PlanTask[];
   /** "requested" | "running" | null - from the goal's metadata. */
   plan_status: string | null;
+  /** True once every task has reached a terminal state (completed/cancelled). */
+  all_done: boolean;
 }
 
 export const goalsApi = {

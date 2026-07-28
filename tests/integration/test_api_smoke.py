@@ -283,3 +283,55 @@ def test_emergency_stop_is_reversible(client):
 
     audit = client.get("/audit-logs").json()
     assert any(a["action"] == "system.resume" for a in audit)
+
+
+def test_goal_plan_endpoint_surfaces_each_agents_actual_result(client):
+    """The operator wants to read what each agent actually reported after
+    running - not just a bare state label. /goals/{id}/plan must surface the
+    latest Run.result_summary per task, and all_done must be true only once
+    every task has reached a terminal state."""
+    import uuid as _uuid
+
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+    from app.models.work import Plan, Run, Task
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    goal = client.post(
+        "/goals",
+        json={"title": "Fix the checkout bug", "description": "Users can't complete checkout."},
+    ).json()
+    goal_id = goal["id"]
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    plan = Plan(organization_id=org_id, goal_id=_uuid.UUID(goal_id), title="Checkout fix", state="drafted")
+    db.add(plan)
+    db.flush()
+    task = Task(
+        organization_id=org_id, plan_id=plan.id, title="Patch the payment handler",
+        description="d", assigned_agent_key="backend_engineer", risk_level="R1",
+        state="completed", idempotency_key=f"{goal_id}-t0", acceptance_criteria={},
+    )
+    db.add(task)
+    db.flush()
+    # An older, superseded run must not win over the latest one.
+    db.add(Run(
+        organization_id=org_id, task_id=task.id, agent_key="backend_engineer",
+        state="failed", result_summary="First attempt failed on a null check.",
+    ))
+    db.flush()
+    db.add(Run(
+        organization_id=org_id, task_id=task.id, agent_key="backend_engineer",
+        state="completed", result_summary="Fixed the null check in payment_handler.py; added a regression test.",
+    ))
+    db.commit()
+    db.close()
+
+    resp = client.get(f"/goals/{goal_id}/plan").json()
+    assert resp["all_done"] is True
+    t = resp["tasks"][0]
+    assert t["result"] == "Fixed the null check in payment_handler.py; added a regression test."

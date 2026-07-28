@@ -70,7 +70,7 @@ export function GoalPlanPanel({
     return <p className="py-4 text-center text-sm text-slate-500">{t("command_center.no_plan_yet")}</p>;
   }
 
-  const { plan, tasks } = data;
+  const { plan, tasks, all_done } = data;
 
   return (
     <div className="flex flex-col gap-3">
@@ -91,6 +91,15 @@ export function GoalPlanPanel({
           </p>
         ) : null}
       </div>
+
+      {/* Once every task has actually finished, say so plainly - this is the
+          "did it actually do anything" answer, not just a plan. */}
+      {all_done ? (
+        <div className="flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/[0.08] px-3 py-2">
+          <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" aria-hidden />
+          <span className="text-[13px] font-semibold text-emerald-200">{t("command_center.goal_all_done")}</span>
+        </div>
+      ) : null}
 
       {/* The tasks it handed out */}
       {tasks.length > 0 ? (
@@ -122,6 +131,16 @@ export function GoalPlanPanel({
                   <p className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-relaxed text-slate-400">
                     {task.description}
                   </p>
+                ) : null}
+                {task.result ? (
+                  <div className="mt-2 rounded-lg border border-white/8 bg-black/20 p-2">
+                    <span className="mb-1 block text-[9.5px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                      {t("command_center.agent_result")}
+                    </span>
+                    <p className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-slate-200">
+                      {task.result}
+                    </p>
+                  </div>
                 ) : null}
                 <div className="mt-2 flex items-center gap-2">
                   <span

@@ -122,7 +122,9 @@
     "company_stopped_hint": "Press Resume to bring the agents back",
     "resume": "Resume",
     "resumed": "Company resumed — agents are working again",
-    "resume_failed": "Could not resume"
+    "resume_failed": "Could not resume",
+    "goal_all_done": "Goal fully done — every task finished",
+    "agent_result": "What the agent produced"
   },
   "goals": {
     "title": "Goals",

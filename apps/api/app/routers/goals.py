@@ -195,11 +195,14 @@ def request_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db:
 @router.get("/{goal_id}/plan")
 def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
     """The durable 'response' to a goal: the CEO's plan (title + summary) and
-    the tasks it produced, each with its assigned agent, risk and live state.
-    This is what the dashboard reads to SHOW the answer - the WS event stream
-    is only the live narration; this endpoint is the record that survives a
-    reload and tells the operator plainly what the company decided to do."""
-    from app.models.work import Plan, Task
+    the tasks it produced, each with its assigned agent, risk, live state, and
+    the ACTUAL RESULT the agent reported (not just a state label) - this is
+    what the operator actually wants to read: "what did the agent say it
+    did", not merely "completed". This is what the dashboard reads to SHOW
+    the answer - the WS event stream is only the live narration; this
+    endpoint is the record that survives a reload and tells the operator
+    plainly what the company decided to do and what came of it."""
+    from app.models.work import Plan, Run, Task
 
     goal = db.get(Goal, goal_id)
     if not goal or goal.organization_id != user.organization_id:
@@ -224,6 +227,23 @@ def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db
         .order_by(Task.created_at.asc())
         .all()
     )
+
+    # One query for every task's latest run rather than N+1 - a real
+    # difference once a plan has several tasks each with retries.
+    task_ids = [t.id for t in tasks]
+    latest_result_by_task: dict = {}
+    if task_ids:
+        runs = (
+            db.query(Run)
+            .filter(Run.task_id.in_(task_ids))
+            .order_by(Run.task_id, Run.created_at.desc())
+            .all()
+        )
+        for r in runs:
+            latest_result_by_task.setdefault(r.task_id, r.result_summary)
+
+    all_terminal = bool(tasks) and all(t.state in ("completed", "cancelled") for t in tasks)
+
     return {
         "plan": {
             "id": str(plan.id),
@@ -239,10 +259,14 @@ def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db
                 "agent_key": t.assigned_agent_key,
                 "risk_level": t.risk_level,
                 "state": t.state,
+                "result": latest_result_by_task.get(t.id) or None,
             }
             for t in tasks
         ],
         "plan_status": meta.get("plan_status"),
+        # True once every task has reached a terminal state - the UI's cue to
+        # stop treating this as "in progress" and show the final rollup.
+        "all_done": all_terminal,
     }
 
 
