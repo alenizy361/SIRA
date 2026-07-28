@@ -11,7 +11,10 @@ from pathlib import Path
 
 import redis
 
-_PACKAGES_ROOT = Path(__file__).resolve().parents[3] / "packages"
+# parents[4] is the repo root (apps/api/app/realtime/bus.py -> [3]=apps,
+# [4]=<repo root>). See publisher.py for why the earlier parents[3] was wrong
+# but harmless.
+_PACKAGES_ROOT = Path(__file__).resolve().parents[4] / "packages"
 if str(_PACKAGES_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGES_ROOT))
 

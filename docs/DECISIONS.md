@@ -2,6 +2,53 @@
 
 Format: date, decision, rationale. Newest first.
 
+## 2026-07-28 — Test the deployment artifacts, not just the source
+
+**Decision:** Added `tests/unit/test_deployment_contract.py`, which asserts
+the contract between the source tree and what actually ships: every source
+tree `apps/api` imports is COPYed into `api.Dockerfile` and present on its
+`PYTHONPATH`; `next.config.ts` enables the `standalone` output that
+`web.Dockerfile`'s runner stage copies; `install.sh` creates the host venv
+`run.sh` depends on; and every `Path(__file__).parents[N]` sys.path
+bootstrap resolves to a directory that exists.
+
+**Rationale — the actual root cause of a painful deploy.** Everything in
+this project was built and verified by running processes *directly on a dev
+machine*. The thing that ships is different in two ways that were never
+exercised: a **containerized** api/web stack, and a **host-level** worker
+process. Every deployment failure came from that gap, one at a time:
+`rsync` missing from the installer's package list; a duplicate top-level
+`gzip` directive nginx rejects; a smoke test that raced container startup;
+`services/claude-worker` never COPYed into the api image
+(`ModuleNotFoundError`, crash-loop); `install.sh` never rebuilding images
+after a source change; `next.config.ts` missing `output: "standalone"`; and
+`run.sh` sourcing a venv nothing created. Each individual fix was correct
+but the *pattern* was the problem — a fix-one-symptom-per-round loop that
+cost the user many attempts.
+
+This session broke that loop by starting a real Docker daemon in the dev
+sandbox and actually building and running the images: the api image now
+verifiably imports `app.main`/`claude_worker`/`contracts`/`permission_engine`/
+`orchestrator` inside the container, the full compose stack (postgres +
+redis + api + web) comes up healthy, containerized Alembic migrations run,
+and `scripts/smoke-test.sh` passes against it end to end. The worker was
+verified by launching `run.sh` in a simulated `APP_ROOT` and watching it
+authenticate the CLI and enter its poll loop. Where the sandbox genuinely
+could not run something (npm install fails against the sandbox's TLS
+proxy), that step was validated another way (building the runner stage from
+a real local `.next/standalone` and confirming `node server.js` serves HTTP
+200) rather than assumed.
+
+The regression tests were themselves verified by reintroducing each bug and
+confirming the corresponding test fails — a guard that cannot fail is not a
+guard.
+
+**Also fixed here:** `publisher.py` and `bus.py` computed
+`parents[3] / "packages"`, which resolves to a nonexistent `apps/packages`.
+It never broke anything because `PYTHONPATH` already covered it, so the
+broken `sys.path` entry sat inert — exactly the kind of latent landmine the
+new test now catches.
+
 ## 2026-07-28 — One shared event publisher, not three ad-hoc ones
 
 **Decision:** Added `apps/api/app/realtime/publisher.py` as the single

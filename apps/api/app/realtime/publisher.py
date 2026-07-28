@@ -9,7 +9,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-_PACKAGES_ROOT = Path(__file__).resolve().parents[3] / "packages"
+# parents[4] is the repo root: this file is apps/api/app/realtime/publisher.py,
+# so [0]=realtime [1]=app [2]=api [3]=apps [4]=<repo root>. An earlier
+# parents[3] here silently pointed at "apps/packages" (which does not exist);
+# it went unnoticed only because PYTHONPATH already contained packages/, so
+# the import worked anyway and the broken sys.path entry was inert.
+_PACKAGES_ROOT = Path(__file__).resolve().parents[4] / "packages"
 if str(_PACKAGES_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGES_ROOT))
 

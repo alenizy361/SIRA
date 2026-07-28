@@ -14,10 +14,18 @@ complete codebase + real local tests in this sandbox; defer the actual
 `scripts/install.sh` run to a session with real VPS/SSH access.
 
 Everything described below as "real" or "tested" was genuinely executed in
-this sandbox: Postgres 16 and Redis run as native processes (not Docker,
-since no daemon is reachable here — `pg_ctlcluster 16 main start` /
-`redis-server --daemonize yes`), and the FastAPI app was actually started
-with `uvicorn` and exercised over real HTTP with `curl`.
+this sandbox: Postgres 16 and Redis run as native processes
+(`pg_ctlcluster 16 main start` / `redis-server --daemonize yes`), and the
+FastAPI app was actually started with `uvicorn` and exercised over real
+HTTP with `curl`.
+
+**Update (2026-07-28):** a Docker daemon was subsequently started here
+(`dockerd`), so the containerized path is no longer untested — the api/web
+images are now really built and the full compose stack really runs. See
+"Deployment path: now actually exercised" below, which supersedes the
+earlier "no Docker daemon" caveat. The remaining untested-here item is the
+`scripts/install.sh` run itself against a real Ubuntu VPS (systemd, nginx
+reload, certbot), which needs a real server.
 
 ## What is DONE and verified
 
@@ -178,6 +186,42 @@ with `uvicorn` and exercised over real HTTP with `curl`.
   Still open: the permission engine isn't yet consulted before these
   actions execute (see gap below), and `run.output.delta` payloads are
   short text deltas, not a full streamed transcript viewer.
+
+## Deployment path: now actually exercised (2026-07-28)
+
+Earlier revisions of this file described the stack as verified, but that
+verification was always done by running processes **directly on the dev
+machine**. The shipped artifacts - a containerized api/web stack plus a
+host-level worker - had never been built or run. A real VPS deployment
+consequently failed seven times in a row, once per untested assumption:
+missing `rsync`; duplicate top-level nginx `gzip`; smoke test racing
+container startup; `services/claude-worker` absent from the api image
+(crash-loop); `install.sh` not rebuilding images after a source change;
+`next.config.ts` missing `output: "standalone"`; and `run.sh` sourcing a
+venv nothing created.
+
+That gap is now closed and verified for real, with a Docker daemon running
+in the dev sandbox:
+
+- `api` image **builds**, and inside the running container `app.main`,
+  `claude_worker`, `contracts`, `permission_engine` and `orchestrator` all
+  import cleanly.
+- Full `docker compose` stack (postgres + redis + api + web) comes up with
+  postgres/redis **healthy**; Alembic migrations run **inside** the api
+  container against the containerized database.
+- `/health/live`, `/health/ready` (reporting postgres+redis ok) and the web
+  app all return 200 through the published ports Nginx proxies to, and
+  `scripts/smoke-test.sh` passes end-to-end against them.
+- `web` runner stage verified by building it from a real `.next/standalone`
+  and confirming `node server.js` serves HTTP 200. (`npm install` itself
+  could not run in this sandbox - its TLS proxy breaks npm - but that step
+  is already proven working on the user's VPS.)
+- `services/claude-worker/run.sh` launched in a simulated `APP_ROOT`:
+  authenticates the Claude CLI and enters its poll loop.
+
+`tests/unit/test_deployment_contract.py` (13 tests) now locks this contract
+in place, and each test was confirmed to fail when its bug is reintroduced.
+**90 automated tests pass** in total.
 
 ## Dependency security scan
 

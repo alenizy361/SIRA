@@ -264,6 +264,52 @@ setup_directory_structure() {
 }
 
 # ---------------------------------------------------------------------------
+# 5b. Host Python venv for services/claude-worker
+# ---------------------------------------------------------------------------
+setup_worker_venv() {
+  # api/web run in Docker, but the claude-worker deliberately does NOT: it
+  # shells out to the `claude` CLI whose login state is per-OS-user and lives
+  # in ~aicompany. So it needs its Python dependencies installed on the HOST.
+  # This step was missing entirely at first, which made
+  # rabit-claude-worker.service crash-loop on a real deployment - run.sh
+  # sourced a $APP_ROOT/.venv that nothing ever created.
+  local venv="$APP_ROOT/.venv"
+  local py=""
+  for candidate in python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then py="$candidate"; break; fi
+  done
+  if [[ -z "$py" ]]; then
+    log_warn "No python3 on PATH — skipping worker venv. rabit-claude-worker.service will not start until Python 3.11+ is installed."
+    return
+  fi
+
+  if [[ ! -x "$venv/bin/python" ]]; then
+    log_step "Creating host Python venv for claude-worker at ${venv}"
+    if ! "$py" -m venv "$venv" 2>/dev/null; then
+      log_warn "Could not create venv with '${py} -m venv' (is python3-venv installed?) — skipping. rabit-claude-worker.service will not start."
+      return
+    fi
+  else
+    log_ok "Worker venv already exists at ${venv}"
+  fi
+
+  log_step "Installing worker dependencies into ${venv}"
+  # The worker imports app.config/app.db/app.models and packages/*, so it
+  # needs the same dependency set as the API itself.
+  if "$venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 && \
+     "$venv/bin/pip" install --quiet -r "$APP_ROOT/apps/api/requirements.txt"; then
+    log_ok "Worker dependencies installed"
+  else
+    log_warn "pip install for the worker venv failed — rabit-claude-worker.service will not start until this is resolved."
+    return
+  fi
+
+  chmod +x "$APP_ROOT/services/claude-worker/run.sh" 2>/dev/null || true
+  # The worker runs as aicompany, so it must be able to read its own venv.
+  chown -R "${AICOMPANY_USER}:${AICOMPANY_USER}" "$venv"
+}
+
+# ---------------------------------------------------------------------------
 # 6. Node.js / claude CLI verification (never inject credentials)
 # ---------------------------------------------------------------------------
 CLAUDE_LOGIN_PENDING=true
@@ -481,6 +527,7 @@ main() {
   create_aicompany_user
   sync_repo_to_app_root
   setup_directory_structure
+  setup_worker_venv
   verify_claude_cli
   generate_env
   # .env may define POSTGRES_*/DB_NAME overrides — load it so downstream
