@@ -665,7 +665,14 @@ main() {
   # Always port 80 via Nginx (default_server when DOMAIN is unset - see
   # configure_nginx) - never a container port directly; the browser is
   # never meant to reach 18080/18081 itself.
-  local dashboard_url="http://${DOMAIN:-$(hostname -I 2>/dev/null | awk '{print $1}')}/"
+  # `hostname -I` returns the machine's own interface addresses. On a NAT'd or
+  # cloud-internal host that first address is a PRIVATE one (10./172.16-31./
+  # 192.168./100.64-127.), which is unreachable from the operator's browser -
+  # printing it as "the dashboard URL" sends people to a dead link. Print it,
+  # but say plainly that the public address/domain is what to actually open.
+  local host_ip dashboard_url
+  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  dashboard_url="http://${DOMAIN:-${host_ip:-localhost}}/"
 
   log_step "Install finished"
   echo ""
@@ -674,6 +681,14 @@ main() {
   echo "  App directory:  ${APP_ROOT}"
   echo "  Backups:        ${BACKUP_ROOT}"
   echo "  Deployed commit: ${SOURCE_COMMIT} (${SOURCE_BRANCH})"
+  if [[ -z "${DOMAIN:-}" ]] && [[ "$host_ip" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; then
+    echo ""
+    echo "  NOTE: ${host_ip} is a PRIVATE address (this host is behind NAT), so that"
+    echo "  URL only works from inside the server's own network. From your browser,"
+    echo "  open this server's PUBLIC IP or domain instead - the site is served on"
+    echo "  port 80 by Nginx either way. Set DOMAIN=<your-domain> before re-running"
+    echo "  this installer to have the correct URL printed here (and to enable TLS)."
+  fi
   echo ""
   if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
     echo "  NOTE: the deployed version could not be determined (source is not a git"

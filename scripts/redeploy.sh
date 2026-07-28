@@ -102,8 +102,11 @@ docker compose up -d --force-recreate web
 
 # ---------------------------------------------------------------------------
 # 4. Verify the NEW UI is genuinely being served, not just that a container is
-#    up. 'space-backdrop' exists only in the redesigned frontend, and "/"
-#    performs a real 307 redirect only when the current page.tsx is deployed.
+#    up. 'space-backdrop' exists only in the redesigned frontend and is the
+#    single reliable discriminator, so it alone gates success. The "/" status
+#    is reported for information only: it is 307 once the config-level
+#    redirect (apps/web/next.config.ts) is deployed, but was 200 on earlier
+#    builds where the hop happened client-side - so it must NOT gate.
 # ---------------------------------------------------------------------------
 say "Verifying the served frontend"
 marker=0
@@ -117,8 +120,8 @@ done
 
 echo ""
 echo "  deployed commit : ${NEW_SHA}"
-echo "  space-backdrop  : ${marker}   (expected: > 0)"
-echo "  GET /           : ${root_code} (expected: 307)"
+echo "  space-backdrop  : ${marker}   (expected: > 0 - this is the check that matters)"
+echo "  GET /           : ${root_code} (307 = server-side redirect; 200 = older client-side hop, also OK)"
 echo ""
 
 if [[ "${marker:-0}" -gt 0 ]]; then

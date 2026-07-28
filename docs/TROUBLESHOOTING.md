@@ -116,9 +116,23 @@ docker compose up -d --force-recreate web
 ```
 
 Verify from outside the box (substitute your host). The current UI ships a
-`space-backdrop` element and `/` performs a real 307 redirect:
+`space-backdrop` element — that marker is the reliable check:
 
 ```bash
 curl -s http://<host>/command-center | grep -c space-backdrop   # expect > 0
-curl -s -o /dev/null -w '%{http_code}\n' http://<host>/          # expect 307
 ```
+
+`/` redirects to `/command-center`. It answers `307` once the config-level
+redirect in `apps/web/next.config.ts` is deployed; older builds answered
+`200` and performed the hop client-side, so the status code alone does not
+tell you whether the deploy is current — use the marker above.
+
+## The installer prints a dashboard URL I cannot open
+
+`install.sh` derives that URL from `hostname -I` when `DOMAIN` is unset, so
+on a NAT'd host it prints the machine's **private** address (e.g.
+`172.16.1.224`), which is only reachable from inside the server's own
+network. The site is served on port 80 by Nginx regardless — open the
+server's **public** IP or domain instead. The installer now detects a
+private address and says so explicitly; set `DOMAIN=<your-domain>` before
+running it to get the right URL printed (and to enable TLS via certbot).
