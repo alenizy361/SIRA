@@ -90,6 +90,29 @@ with `uvicorn` and exercised over real HTTP with `curl`.
   category of "done" that means "written and syntax-valid," not
   "executed end-to-end," and is flagged as such deliberately.
 
+- **CEO-agent auto-planning is now real and wired in**: `POST
+  /goals/{id}/plan` (`apps/api/app/services/planning.py`) makes an actual
+  `claude` CLI call with `--json-schema` (CEO-agent role prompt), and the
+  resulting plan is persisted as a real `Plan` + `PlanStep` + `Task` rows
+  and the goal's state machine advances to `plan_drafted`. Verified twice
+  over real HTTP against the live goal created earlier - produced a
+  genuinely coherent 4-5 task plan correctly assigned across
+  ux_research/analytics/product_design/frontend_engineer/qa/ceo with
+  R0-R2 risk levels, and again as an automated test
+  (`tests/integration/test_planning_e2e.py`, passing). Building this
+  surfaced and fixed a real prompt-construction bug: `prompt_builder.py`
+  used to unconditionally append prose "end with a decision summary"
+  instructions that conflicted with strict `--json-schema` mode; it now
+  only appends that instruction when no `output_schema` is set.
+- Integration tests now run against a dedicated `rabit_os_test` database
+  (not the interactive `rabit_os` dev DB used for manual demos) after a
+  test-isolation bug surfaced: `claude_worker.worker.run_once` scans ALL
+  organizations, so leftover demo data (the CEO-planning demo's 5 real
+  `ready` tasks) made a "no ready tasks" test flaky. **72 automated tests
+  now pass** (`pytest tests/unit tests/integration tests/security`,
+  excluding the two real-CLI-invoking tests kept manual-run-once to avoid
+  spending Claude usage on every CI run).
+
 ## In progress
 
 - **`apps/web`**: Next.js command center - delegated to a background agent
@@ -115,13 +138,17 @@ with `uvicorn` and exercised over real HTTP with `curl`.
    Google Analytics/Search Console/Ads, email, support platform, payment
    processor) - all correctly show `configured: false`. Wiring any of
    these requires the user to supply real credentials.
-4. **Voice experience, budgets/spend enforcement wiring into the
-   permission engine at the API-route level, and the CEO/PM auto-planning
-   step (goal → plan → tasks) are not yet wired into `apps/api` routes** -
-   the underlying pieces (permission-engine, orchestrator scheduler,
-   claude-worker) are real and tested in isolation, but a route that
-   chains "goal created → CEO agent plans it → tasks created" does not
-   exist yet. Today, `POST /goals` only creates the goal row.
+4. **Voice experience and budgets/spend enforcement wiring into the
+   permission engine at the API-route level are not yet connected** - the
+   underlying pieces (permission-engine, budget model) are real and tested
+   in isolation, but no route currently calls `PermissionEngine.evaluate()`
+   before executing a mutating action, and no route reserves/commits
+   against a `Budget` row. (Goal → plan → tasks IS wired now - see
+   `POST /goals/{id}/plan` above - this gap is narrower than it was.)
+   `services/claude-worker`'s poll loop (`worker.py`) also does not yet
+   call the permission engine before executing a leased task - it trusts
+   the task's `risk_level` column as already-classified. Both are real,
+   scoped follow-ups, not aspirational.
 5. **`tests/security` now has 22 passing tests** (prompt-injection
    structural guarantees, command-injection/shell=True AST check,
    cross-organization data isolation with a second org inserted directly

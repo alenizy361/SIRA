@@ -146,6 +146,9 @@
     "status_ok": "سليم",
     "status_fail": "متعطل"
   },
+  "tasks": {
+    "depends_on": "يعتمد على:"
+  },
   "placeholders": {
     "plans_title": "الخطط",
     "tasks_title": "المهام",

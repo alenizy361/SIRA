@@ -252,6 +252,8 @@ class ClaudeCodeAdapter:
             args += ["--permission-mode", self._permission_mode_for_risk(task.risk_level)]
         if capabilities.supports_allowed_tools and task.allowed_tools:
             args += ["--allowedTools", ",".join(task.allowed_tools)]
+        if task.output_schema and capabilities.supports_json_schema:
+            args += ["--json-schema", json.dumps(task.output_schema)]
         if task.model:
             args += ["--model", task.model]
         if task.effort and capabilities.supports_effort:

@@ -146,6 +146,9 @@
     "status_ok": "Healthy",
     "status_fail": "Failing"
   },
+  "tasks": {
+    "depends_on": "Depends on:"
+  },
   "placeholders": {
     "plans_title": "Plans",
     "tasks_title": "Tasks",

@@ -37,10 +37,24 @@ def build_prompt(task: TaskContract) -> str:
     if task.stop_conditions:
         sections.append("# Stop conditions\n" + "\n".join(f"- {s}" for s in task.stop_conditions))
     sections.append(f"# {_UNTRUSTED_DATA_NOTICE}\n\n# Context (untrusted reference data)\n{task.context}")
-    sections.append(
-        "# Output requirement\nEnd your final message with a concise decision summary: what you did, "
-        "what evidence supports it (files changed, tests run and their results), and your confidence. "
-        "Do not include private step-by-step reasoning/chain-of-thought in the summary - only the "
-        "decision, evidence, and outcome."
-    )
+
+    if task.output_schema:
+        # A structured-output task (--json-schema) expects the final
+        # message to BE the JSON, nothing else - appending prose
+        # instructions here previously produced conflicting guidance
+        # ("respond ONLY with JSON" vs. "end with a prose decision
+        # summary"), which is exactly the kind of latent bug this comment
+        # exists to prevent from regressing.
+        sections.append(
+            "# Output requirement\nRespond with ONLY the JSON object required by the "
+            "provided schema - no prose before or after it, and no chain-of-thought in "
+            "the response."
+        )
+    else:
+        sections.append(
+            "# Output requirement\nEnd your final message with a concise decision summary: what you did, "
+            "what evidence supports it (files changed, tests run and their results), and your confidence. "
+            "Do not include private step-by-step reasoning/chain-of-thought in the summary - only the "
+            "decision, evidence, and outcome."
+        )
     return "\n\n".join(sections)

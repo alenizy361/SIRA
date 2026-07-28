@@ -185,3 +185,36 @@ export const healthApi = {
 export const systemApi = {
   emergencyStop: () => api.post<{ status: string }>("/system/emergency-stop"),
 };
+
+// ---- Endpoints not yet implemented on the backend (see docs/BUILD_STATUS.md).
+// These call sensibly-named REST paths; callers treat 404/405 as "not
+// available in this build yet" via ApiError.notImplemented, never as empty
+// real data. ----
+
+export const plansApi = {
+  list: () => api.get<unknown[]>("/plans"),
+};
+
+export const tasksApi = {
+  list: () => api.get<unknown[]>("/tasks"),
+};
+
+export const runsApi = {
+  list: () => api.get<unknown[]>("/runs"),
+};
+
+export const memoryApi = {
+  list: () => api.get<unknown[]>("/memory"),
+};
+
+export const budgetsApi = {
+  list: () => api.get<unknown[]>("/budgets"),
+};
+
+export const analyticsApi = {
+  summary: () => api.get<unknown>("/analytics"),
+};
+
+export const incidentsApi = {
+  list: () => api.get<unknown[]>("/incidents"),
+};

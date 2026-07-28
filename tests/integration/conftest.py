@@ -22,7 +22,12 @@ for p in [
 ]:
     sys.path.insert(0, str(p))
 
-TEST_DATABASE_URL = "postgresql+psycopg://rabit:rabit_dev_local_only@localhost:5432/rabit_os"
+TEST_DATABASE_URL = "postgresql+psycopg://rabit:rabit_dev_local_only@localhost:5432/rabit_os_test"
+# Deliberately the dedicated test DB, NOT the interactive `rabit_os` dev
+# database used for manual curl/demo sessions - some of these tests (e.g.
+# claude_worker.worker.run_once) scan ALL organizations, so running them
+# against a DB that also accumulates real demo data (like the CEO-agent
+# planning demo) makes global-count assertions flaky by design.
 
 
 @pytest.fixture(scope="session")
@@ -55,6 +60,7 @@ def org_id(db):
     db.execute(text("DELETE FROM runs WHERE organization_id = :id"), {"id": oid})
     db.execute(text("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE organization_id = :id)"), {"id": oid})
     db.execute(text("DELETE FROM tasks WHERE organization_id = :id"), {"id": oid})
+    db.execute(text("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE organization_id = :id)"), {"id": oid})
     db.execute(text("DELETE FROM plans WHERE organization_id = :id"), {"id": oid})
     db.execute(text("DELETE FROM goals WHERE organization_id = :id"), {"id": oid})
     db.execute(text("DELETE FROM organizations WHERE id = :id"), {"id": oid})

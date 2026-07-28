@@ -18,6 +18,7 @@ from app.db import get_db
 from app.models.company import Goal
 from app.models.governance import AuditLog
 from app.models.identity import User
+from app.services.planning import PlanningError, plan_goal
 
 router = APIRouter(prefix="/goals", tags=["goals"])
 
@@ -102,6 +103,31 @@ def transition(
     db.commit()
     _audit(db, user, "goal.transition", str(goal.id), "executed", f"-> {new_state.value}")
     return _goal_out(goal)
+
+
+@router.post("/{goal_id}/plan")
+def create_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+    """Invokes the real CEO-agent planning flow (app.services.planning) -
+    this makes an actual Claude Code CLI call, so it is synchronous and can
+    take up to ~1-3 minutes. Constitution: no placeholder business logic -
+    a planning failure surfaces as a 502, it never falls back to fake data.
+    """
+    goal = db.get(Goal, goal_id)
+    if not goal or goal.organization_id != user.organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found")
+    if goal.state != GoalState.GOAL_CAPTURED.value:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Goal already in state '{goal.state}'")
+
+    try:
+        plan = plan_goal(db, goal)
+    except PlanningError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    _audit(db, user, "goal.plan", str(goal.id), "executed", f"Plan '{plan.title}' drafted by CEO agent")
+    return {
+        "goal": _goal_out(goal),
+        "plan": {"id": str(plan.id), "title": plan.title, "summary": plan.summary, "state": plan.state},
+    }
 
 
 def _goal_out(goal: Goal) -> dict:
