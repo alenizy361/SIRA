@@ -10,9 +10,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY packages /app/packages
 COPY services/orchestrator /app/services/orchestrator
+COPY services/claude-worker /app/services/claude-worker
 COPY apps/api /app/apps/api
 
-ENV PYTHONPATH=/app/apps/api:/app/packages:/app/packages/permission-engine:/app/services
+ENV PYTHONPATH=/app/apps/api:/app/packages:/app/packages/permission-engine:/app/services:/app/services/claude-worker
 
 WORKDIR /app/apps/api
 
