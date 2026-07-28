@@ -166,6 +166,10 @@ export const goalsApi = {
     api.post<Goal>("/goals", payload),
   transition: (id: string, target_state: string) =>
     api.post<Goal>(`/goals/${id}/transition`, { target_state }),
+  // Enqueues CEO-agent planning on the host worker (returns 202). The plan +
+  // tasks appear asynchronously via the goal state and the event stream.
+  requestPlan: (id: string) =>
+    api.post<{ plan_status: string }>(`/goals/${id}/plan`, {}),
 };
 
 export const approvalsApi = {

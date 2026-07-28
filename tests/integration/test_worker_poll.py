@@ -116,3 +116,80 @@ def test_emergency_stop_autonomy_mode_blocks_new_task_assignment(db, org_id, mon
     db.commit()
     executed_after_resume = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
     assert executed_after_resume == 1
+
+
+def test_pending_plan_request_is_claimed_and_processed(db, org_id, monkeypatch):
+    """A goal flagged plan_status=requested must be picked up by the worker,
+    handed to CEO planning (mocked here), and marked done - and never
+    double-claimed on a second tick."""
+    import claude_worker.worker as worker_mod
+    from app.models.company import Goal
+
+    calls = {"n": 0}
+
+    def _fake_plan_goal(db_, goal_):
+        calls["n"] += 1
+        # emulate what real plan_goal does to the goal's state
+        goal_.state = "plan_drafted"
+        db_.add(goal_)
+        db_.commit()
+        return SimpleNamespace(id=uuid.uuid4(), title="Mock plan", summary="s", state="drafted")
+
+    # plan_goal is imported lazily inside _run_pending_plans from
+    # app.services.planning, so patch it there.
+    import app.services.planning as planning_mod
+    monkeypatch.setattr(planning_mod, "plan_goal", _fake_plan_goal)
+
+    goal = Goal(
+        organization_id=org_id,
+        created_by=None,
+        title="Improve funnel",
+        description="Fix the biggest drop-off",
+        state="goal_captured",
+        metadata_json={"plan_status": "requested"},
+    )
+    db.add(goal)
+    db.commit()
+    db.refresh(goal)
+
+    ran = worker_mod._run_pending_plans(db, org_id)
+    assert ran == 1
+    assert calls["n"] == 1
+
+    db.refresh(goal)
+    assert goal.metadata_json.get("plan_status") == "done"
+    assert goal.state == "plan_drafted"
+
+    # Second tick must not re-run planning for an already-done goal.
+    ran_again = worker_mod._run_pending_plans(db, org_id)
+    assert ran_again == 0
+    assert calls["n"] == 1
+
+
+def test_pending_plan_failure_marks_goal_failed(db, org_id, monkeypatch):
+    import claude_worker.worker as worker_mod
+    import app.services.planning as planning_mod
+    from app.models.company import Goal
+    from app.services.planning import PlanningError
+
+    def _boom(db_, goal_):
+        raise PlanningError("CEO agent returned no valid tasks")
+
+    monkeypatch.setattr(planning_mod, "plan_goal", _boom)
+
+    goal = Goal(
+        organization_id=org_id,
+        created_by=None,
+        title="G",
+        description="d",
+        state="goal_captured",
+        metadata_json={"plan_status": "requested"},
+    )
+    db.add(goal)
+    db.commit()
+
+    ran = worker_mod._run_pending_plans(db, org_id)
+    assert ran == 0
+    db.refresh(goal)
+    assert goal.metadata_json.get("plan_status") == "failed"
+    assert "plan_error" in goal.metadata_json

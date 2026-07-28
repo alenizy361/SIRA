@@ -19,7 +19,6 @@ from app.models.company import Goal
 from app.models.governance import AuditLog
 from app.models.identity import User
 from app.realtime.publisher import publish, publish_core_state
-from app.services.planning import PlanningError, plan_goal
 from contracts.events import CoreState, EntityRef, EventType
 
 router = APIRouter(prefix="/goals", tags=["goals"])
@@ -111,12 +110,17 @@ def transition(
     return _goal_out(goal)
 
 
-@router.post("/{goal_id}/plan")
-def create_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
-    """Invokes the real CEO-agent planning flow (app.services.planning) -
-    this makes an actual Claude Code CLI call, so it is synchronous and can
-    take up to ~1-3 minutes. Constitution: no placeholder business logic -
-    a planning failure surfaces as a 502, it never falls back to fake data.
+@router.post("/{goal_id}/plan", status_code=status.HTTP_202_ACCEPTED)
+def request_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+    """ENQUEUES CEO-agent planning - it does NOT run it here.
+
+    Planning makes a real `claude` CLI call, and the CLI's authenticated
+    session lives on the HOST (the aicompany user), not inside this API
+    container. So the API only records "planning was requested" on the goal;
+    the host-level claude-worker (services/claude-worker/worker.py) picks it
+    up on its next poll, runs the CEO agent, and writes the Plan + Task graph
+    while streaming live events. This returns 202 immediately - the dashboard
+    watches the goal's state and the event stream for the result.
     """
     goal = db.get(Goal, goal_id)
     if not goal or goal.organization_id != user.organization_id:
@@ -124,23 +128,23 @@ def create_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: 
     if goal.state != GoalState.GOAL_CAPTURED.value:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Goal already in state '{goal.state}'")
 
-    publish_core_state(user.organization_id, CoreState.PLANNING, "ceo", str(goal.id))
-    try:
-        plan = plan_goal(db, goal)
-    except PlanningError as exc:
-        publish_core_state(user.organization_id, CoreState.WARNING, "ceo", str(goal.id))
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    meta = dict(goal.metadata_json or {})
+    if meta.get("plan_status") == "requested":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Planning already requested for this goal")
+    meta["plan_status"] = "requested"
+    meta["plan_requested_by"] = str(user.id)
+    goal.metadata_json = meta
+    db.add(goal)
+    db.commit()
 
-    _audit(db, user, "goal.plan", str(goal.id), "executed", f"Plan '{plan.title}' drafted by CEO agent")
+    _audit(db, user, "goal.plan_requested", str(goal.id), "executed", "CEO-agent planning enqueued for the host worker")
     publish(
-        user.organization_id, EventType.PLAN_CREATED, "ceo", str(goal.id),
-        payload={"title": plan.title}, entities=[EntityRef(type="goal", id=str(goal.id)), EntityRef(type="plan", id=str(plan.id))],
+        user.organization_id, EventType.GOAL_CREATED, "ceo", str(goal.id),
+        payload={"title": goal.title, "plan_status": "requested"},
+        entities=[EntityRef(type="goal", id=str(goal.id))],
     )
-    publish_core_state(user.organization_id, CoreState.IDLE, "ceo", str(goal.id))
-    return {
-        "goal": _goal_out(goal),
-        "plan": {"id": str(plan.id), "title": plan.title, "summary": plan.summary, "state": plan.state},
-    }
+    publish_core_state(user.organization_id, CoreState.PLANNING, "ceo", str(goal.id))
+    return {"goal": _goal_out(goal), "plan_status": "requested"}
 
 
 def _goal_out(goal: Goal) -> dict:

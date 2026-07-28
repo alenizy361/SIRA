@@ -77,10 +77,71 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
     for org_id, autonomy_mode in db.query(Organization.id, Organization.autonomy_mode).all():
         if autonomy_mode not in AUTONOMOUS_EXECUTION_MODES:
             continue
+        # 1. Goals whose owner asked the CEO agent to plan them. This runs on
+        #    the host (not the API container) precisely because it needs the
+        #    `claude` CLI's authenticated session - see request_plan() in
+        #    apps/api/app/routers/goals.py.
+        executed += _run_pending_plans(db, org_id)
+        # 2. Tasks a plan produced, ready for an engineer/analyst agent to run.
         ready = pick_ready_tasks(db, org_id, agent_concurrency_limits)
         for task in ready:
             executed += _execute_task(db, adapter, task)
     return executed
+
+
+def _run_pending_plans(db, org_id) -> int:
+    """Finds goals flagged plan_status=requested and runs CEO planning for
+    each, on the host where the claude CLI session lives."""
+    from app.models.company import Goal
+    from app.services.planning import PlanningError, plan_goal
+    from contracts.events import EntityRef, EventType
+
+    ran = 0
+    goals = (
+        db.query(Goal)
+        .filter(Goal.organization_id == org_id, Goal.state == "goal_captured")
+        .all()
+    )
+    for goal in goals:
+        meta = dict(goal.metadata_json or {})
+        if meta.get("plan_status") != "requested":
+            continue
+        # Claim it first so a second worker tick (or a second worker) never
+        # double-plans the same goal.
+        meta["plan_status"] = "running"
+        goal.metadata_json = meta
+        db.add(goal)
+        db.commit()
+
+        publish_core_state(org_id, CoreState.PLANNING, "ceo", str(goal.id))
+        try:
+            plan = plan_goal(db, goal)
+        except PlanningError as exc:
+            logger.error("Planning failed for goal %s: %s", goal.id, exc)
+            db.refresh(goal)
+            meta = dict(goal.metadata_json or {})
+            meta["plan_status"] = "failed"
+            meta["plan_error"] = str(exc)[:500]
+            goal.metadata_json = meta
+            db.add(goal)
+            db.commit()
+            publish_core_state(org_id, CoreState.WARNING, "ceo", str(goal.id))
+            continue
+
+        db.refresh(goal)
+        meta = dict(goal.metadata_json or {})
+        meta["plan_status"] = "done"
+        goal.metadata_json = meta
+        db.add(goal)
+        db.commit()
+        publish(
+            org_id, EventType.PLAN_CREATED, "ceo", str(goal.id),
+            payload={"title": plan.title},
+            entities=[EntityRef(type="goal", id=str(goal.id)), EntityRef(type="plan", id=str(plan.id))],
+        )
+        publish_core_state(org_id, CoreState.IDLE, "ceo", str(goal.id))
+        ran += 1
+    return ran
 
 
 def _task_entities(task: Task, run=None) -> list[EntityRef]:

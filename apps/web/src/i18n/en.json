@@ -82,7 +82,12 @@
     "voice_unsupported": "Voice input isn't supported in this browser. Use the text field instead.",
     "voice_confirm_title": "Confirm interpreted goal",
     "voice_confirm_body": "Here's what we heard. Edit if needed, then create the goal.",
-    "voice_speak_back": "Read state aloud"
+    "voice_speak_back": "Read state aloud",
+    "agents_active": "agents active",
+    "transmissions": "Live transmissions",
+    "request_plan": "Ask the CEO to plan this",
+    "plan_requested": "Planning requested — agents are working now",
+    "plan_already_requested": "Planning already in progress for this goal"
   },
   "goals": {
     "title": "Goals",

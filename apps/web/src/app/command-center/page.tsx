@@ -5,14 +5,23 @@ import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useI18n } from "@/i18n/I18nProvider";
 import { useToast } from "@/components/ToastProvider";
-import { AICore } from "@/components/AICore";
+import { AgentOrbit } from "@/components/AgentOrbit";
 import { VoiceCapture } from "@/components/VoiceCapture";
 import { SpeakButton } from "@/components/SpeakButton";
+import { TransmissionsFeed } from "@/components/TransmissionsFeed";
 import { useEventStore } from "@/store/eventStore";
-import { approvalsApi, goalsApi, healthApi, systemApi, ApiError } from "@/lib/api";
+import {
+  agentsApi,
+  approvalsApi,
+  goalsApi,
+  healthApi,
+  systemApi,
+  ApiError,
+  type Goal,
+} from "@/lib/api";
 
 export default function CommandCenterPage() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const [goalTitle, setGoalTitle] = useState("");
@@ -20,9 +29,10 @@ export default function CommandCenterPage() {
 
   const coreState = useEventStore((s) => s.coreState);
   const wsStatus = useEventStore((s) => s.wsStatus);
-  const events = useEventStore((s) => s.events);
 
+  const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: agentsApi.list });
   const approvalsQuery = useQuery({ queryKey: ["approvals"], queryFn: approvalsApi.list });
+  const goalsQuery = useQuery({ queryKey: ["goals"], queryFn: goalsApi.list });
   const healthQuery = useQuery({
     queryKey: ["health-dependencies"],
     queryFn: healthApi.dependencies,
@@ -37,6 +47,23 @@ export default function CommandCenterPage() {
       queryClient.invalidateQueries({ queryKey: ["goals"] });
     },
     onError: () => toast.show(t("common.error_generic"), "error"),
+  });
+
+  // Kick off CEO-agent planning for the most recent goal that hasn't been
+  // planned yet - this is what makes the orbit come alive with real activity.
+  const requestPlan = useMutation({
+    mutationFn: (goalId: string) => goalsApi.requestPlan(goalId),
+    onSuccess: () => {
+      toast.show(t("command_center.plan_requested"), "success");
+      queryClient.invalidateQueries({ queryKey: ["goals"] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 409) {
+        toast.show(t("command_center.plan_already_requested"), "info");
+      } else {
+        toast.show(t("common.error_generic"), "error");
+      }
+    },
   });
 
   const emergencyStop = useMutation({
@@ -58,63 +85,104 @@ export default function CommandCenterPage() {
     createGoal.mutate(trimmed);
   }
 
+  const agents = agentsQuery.data ?? [];
+  const enabledCount = agents.filter((a) => a.enabled).length;
   const stateLabel = t(`core_states.${coreState}`);
+  const capturedGoal: Goal | undefined = (goalsQuery.data ?? []).find(
+    (g) => g.state === "goal_captured"
+  );
 
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-4">
-      <h1 className="text-lg font-semibold">{t("command_center.title")}</h1>
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        {/* AI Core */}
-        <div className="flex flex-col items-center justify-center rounded-2xl border border-white/10 bg-gradient-to-b from-slate-900 to-slate-950 p-2 lg:col-span-2">
-          <div className="h-64 w-full sm:h-80">
-            <AICore state={coreState} />
-          </div>
-          <div className="mb-2 flex items-center gap-2 text-sm">
-            <span className="rounded-full border border-white/10 px-3 py-1 text-xs font-medium text-slate-300">
-              {stateLabel}
-            </span>
-            <span
-              className={`inline-block h-2 w-2 rounded-full ${
-                wsStatus === "open" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
-              }`}
-              aria-hidden
-            />
-            <span className="text-xs text-slate-500">
-              {wsStatus === "open" ? t("common.connected") : t("common.reconnecting")}
-            </span>
-            <SpeakButton text={stateLabel} />
-          </div>
+    <div className="mx-auto flex max-w-7xl flex-col gap-4">
+      {/* header strip */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <h1 className="text-lg font-semibold tracking-tight">{t("command_center.title")}</h1>
+          <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs font-medium text-slate-300">
+            {stateLabel}
+          </span>
+          <SpeakButton text={stateLabel} />
         </div>
-
-        {/* Goal input + voice */}
-        <div className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-          <form onSubmit={handleCreateGoal} className="flex flex-col gap-2">
-            <label className="text-sm font-medium text-slate-300">
-              {t("command_center.goal_input_label")}
-            </label>
-            <textarea
-              value={goalTitle}
-              onChange={(e) => setGoalTitle(e.target.value)}
-              placeholder={t("command_center.goal_input_placeholder")}
-              rows={3}
-              className="rounded-lg border border-white/10 bg-slate-900 p-3 text-sm"
-            />
-            <button
-              type="submit"
-              disabled={createGoal.isPending || !goalTitle.trim()}
-              className="min-h-[44px] rounded-lg bg-emerald-500 text-sm font-semibold text-slate-950 disabled:opacity-40"
-            >
-              {t("command_center.create_goal")}
-            </button>
-          </form>
-
-          <VoiceCapture onConfirmed={(text) => setGoalTitle(text)} />
+        <div className="flex items-center gap-2 text-xs">
+          <span
+            className={`inline-block h-2 w-2 rounded-full ${
+              wsStatus === "open" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+            }`}
+            aria-hidden
+          />
+          <span className="text-slate-400">
+            {wsStatus === "open" ? t("common.connected") : t("common.reconnecting")}
+          </span>
+          <span className="text-slate-600">·</span>
+          <span className="text-slate-400">
+            {enabledCount}/{agents.length} {t("command_center.agents_active")}
+          </span>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {/* Pending approvals */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+        {/* the living orbit - the hero */}
+        <div className="lg:col-span-3">
+          <AgentOrbit agents={agents} coreState={coreState} />
+        </div>
+
+        {/* command console + live transmissions */}
+        <div className="flex flex-col gap-4 lg:col-span-2">
+          {/* command console */}
+          <div className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+            <form onSubmit={handleCreateGoal} className="flex flex-col gap-2">
+              <label className="text-sm font-medium text-slate-300">
+                {t("command_center.goal_input_label")}
+              </label>
+              <textarea
+                value={goalTitle}
+                onChange={(e) => setGoalTitle(e.target.value)}
+                placeholder={t("command_center.goal_input_placeholder")}
+                rows={2}
+                className="rounded-lg border border-white/10 bg-slate-900 p-3 text-sm outline-none focus:border-emerald-400/40"
+              />
+              <button
+                type="submit"
+                disabled={createGoal.isPending || !goalTitle.trim()}
+                className="min-h-[44px] rounded-lg bg-emerald-500 text-sm font-semibold text-slate-950 transition-opacity disabled:opacity-40"
+              >
+                {t("command_center.create_goal")}
+              </button>
+            </form>
+
+            <VoiceCapture onConfirmed={(text) => setGoalTitle(text)} />
+
+            {/* plan trigger - only when there is a captured goal awaiting a plan */}
+            {capturedGoal ? (
+              <button
+                type="button"
+                onClick={() => requestPlan.mutate(capturedGoal.id)}
+                disabled={requestPlan.isPending}
+                className="min-h-[44px] rounded-lg border border-violet-400/40 bg-violet-500/10 text-sm font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:opacity-40"
+              >
+                {t("command_center.request_plan")}
+                <span className="block truncate text-[11px] font-normal text-violet-300/70">
+                  {capturedGoal.title}
+                </span>
+              </button>
+            ) : null}
+          </div>
+
+          {/* live transmissions */}
+          <div className="flex flex-1 flex-col rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-slate-300">
+                {t("command_center.transmissions")}
+              </h2>
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" aria-hidden />
+            </div>
+            <TransmissionsFeed agents={agents} />
+          </div>
+        </div>
+      </div>
+
+      {/* status strip */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Link
           href="/approvals"
           className="flex flex-col gap-1 rounded-2xl border border-white/10 bg-white/[0.03] p-4 hover:bg-white/[0.05]"
@@ -128,7 +196,6 @@ export default function CommandCenterPage() {
           <span className="text-xs text-emerald-300">{t("command_center.view_all")} →</span>
         </Link>
 
-        {/* System health */}
         <div className="flex flex-col gap-2 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
           <span className="text-xs font-medium text-slate-400">
             {t("command_center.system_health")}
@@ -157,7 +224,6 @@ export default function CommandCenterPage() {
           )}
         </div>
 
-        {/* Emergency stop */}
         <div className="flex flex-col justify-between gap-2 rounded-2xl border border-red-400/20 bg-red-500/[0.05] p-4">
           <span className="text-xs font-medium text-red-200">
             {t("command_center.emergency_stop")}
@@ -195,33 +261,6 @@ export default function CommandCenterPage() {
             </div>
           )}
         </div>
-      </div>
-
-      {/* Live event stream */}
-      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-        <h2 className="mb-3 text-sm font-semibold text-slate-300">
-          {t("command_center.live_events")}
-        </h2>
-        {events.length === 0 ? (
-          <p className="text-sm text-slate-500">{t("command_center.no_events")}</p>
-        ) : (
-          <ul className="flex max-h-80 flex-col gap-2 overflow-y-auto">
-            {events.map((event) => (
-              <li
-                key={event.event_id}
-                className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2 text-xs"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium text-slate-200">{event.type}</span>
-                  <span className="text-slate-500">
-                    {new Date(event.timestamp).toLocaleTimeString()}
-                  </span>
-                </div>
-                <div className="text-slate-500">{event.actor}</div>
-              </li>
-            ))}
-          </ul>
-        )}
       </div>
     </div>
   );
