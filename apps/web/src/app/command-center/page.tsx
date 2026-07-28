@@ -1,15 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useI18n } from "@/i18n/I18nProvider";
 import { useToast } from "@/components/ToastProvider";
-import { AgentOrbit } from "@/components/AgentOrbit";
+import { NeuralCommandBoard } from "@/components/NeuralCommandBoard";
 import { VoiceCapture } from "@/components/VoiceCapture";
 import { SpeakButton } from "@/components/SpeakButton";
-import { ConversationStream } from "@/components/ConversationStream";
-import { useEventStore } from "@/store/eventStore";
+import { useEventStore, type WireEvent } from "@/store/eventStore";
+import { agentMeta } from "@/lib/agentMeta";
+import { toTransmission, TONE_COLOR } from "@/lib/transmissions";
 import {
   agentsApi,
   approvalsApi,
@@ -20,6 +21,62 @@ import {
   type Goal,
 } from "@/lib/api";
 
+/** Compact live feed - every REAL event as "<agent> <did> <what>". */
+function LiveFeed({ agents }: { agents: { agent_key: string; display_name_en: string; display_name_ar: string }[] }) {
+  const { t, locale } = useI18n();
+  const events = useEventStore((s) => s.events);
+
+  const nameFor = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const a of agents) map.set(a.agent_key, locale === "ar" ? a.display_name_ar : a.display_name_en);
+    return (actor: string) => map.get(actor) || (actor === "system" ? (locale === "ar" ? "النظام" : "System") : actor);
+  }, [agents, locale]);
+
+  const visible = useMemo(
+    () => events.filter((e) => e.type !== "core.state.changed").slice(0, 14),
+    [events]
+  );
+
+  if (visible.length === 0) {
+    return <p className="py-6 text-center text-xs text-slate-500">{t("command_center.no_events")}</p>;
+  }
+  return (
+    <div className="flex flex-col">
+      {visible.map((e: WireEvent) => {
+        const tx = toTransmission(e);
+        const meta = agentMeta(e.actor);
+        const time = new Date(e.timestamp).toLocaleTimeString(locale === "ar" ? "ar-SA" : undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+        return (
+          <div
+            key={e.event_id}
+            className="grid grid-cols-[auto_1fr_auto] items-center gap-2 border-t border-white/5 py-2 first:border-t-0"
+          >
+            <span
+              className="h-2 w-2 rounded-full"
+              style={{ background: meta.color, boxShadow: `0 0 8px ${meta.color}` }}
+              aria-hidden
+            />
+            <span className="min-w-0">
+              <span className="block truncate text-[11.5px] font-bold" style={{ color: meta.color }}>
+                {nameFor(e.actor)}
+              </span>
+              <span className="block truncate text-[10.5px] text-slate-400">
+                <span style={{ color: TONE_COLOR[tx.tone] }}>{locale === "ar" ? tx.verbAr : tx.verbEn}</span>
+                {tx.detail ? ` · ${tx.detail}` : ""}
+              </span>
+            </span>
+            <time className="text-[9.5px] tabular-nums text-slate-600">{time}</time>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function CommandCenterPage() {
   const { t } = useI18n();
   const toast = useToast();
@@ -29,6 +86,7 @@ export default function CommandCenterPage() {
 
   const coreState = useEventStore((s) => s.coreState);
   const wsStatus = useEventStore((s) => s.wsStatus);
+  const events = useEventStore((s) => s.events);
 
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: agentsApi.list });
   const approvalsQuery = useQuery({ queryKey: ["approvals"], queryFn: approvalsApi.list });
@@ -89,9 +147,16 @@ export default function CommandCenterPage() {
   const capturedGoal: Goal | undefined = (goalsQuery.data ?? []).find(
     (g) => g.state === "goal_captured"
   );
+  const pendingApprovals = approvalsQuery.data ?? [];
+
+  // Real activity gauge: events that landed in the last 60s.
+  const eventsPerMin = useMemo(() => {
+    const cutoff = Date.now() - 60_000;
+    return events.filter((e) => new Date(e.timestamp).getTime() > cutoff).length;
+  }, [events]);
 
   return (
-    <div className="mx-auto flex max-w-[1600px] flex-col gap-4">
+    <div className="mx-auto flex max-w-[1680px] flex-col gap-4">
       {/* HUD header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -120,148 +185,170 @@ export default function CommandCenterPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
-        {/* Core stage + console */}
-        <div className="flex flex-col gap-4 xl:col-span-7">
-          <div className="relative">
-            <AgentOrbit agents={agents} coreState={coreState} />
-          </div>
-
-          {/* command console */}
-          <div className="glass flex flex-col gap-3 rounded-2xl p-4">
-            <form onSubmit={handleCreateGoal} className="flex flex-col gap-2">
-              <label className="text-sm font-medium text-slate-300">
-                {t("command_center.goal_input_label")}
-              </label>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <textarea
-                  value={goalTitle}
-                  onChange={(e) => setGoalTitle(e.target.value)}
-                  placeholder={t("command_center.goal_input_placeholder")}
-                  rows={1}
-                  className="min-h-[44px] flex-1 rounded-lg border border-white/10 bg-slate-900/60 p-3 text-sm outline-none focus:border-emerald-400/40"
+      {/* three-column neural layout */}
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[250px_minmax(0,1fr)_300px]">
+        {/* side A: status + voice + approvals */}
+        <div className="order-2 flex min-w-0 flex-col gap-4 xl:order-1">
+          <section className="glass rounded-2xl p-4">
+            <h3 className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">
+              {t("command_center.core_status")}
+            </h3>
+            <div className="flex flex-col gap-3 text-sm">
+              <div className="flex items-baseline justify-between">
+                <span className="text-xs text-slate-400">{t("command_center.core_stage")}</span>
+                <b className="text-violet-300">{stateLabel}</b>
+              </div>
+              <div className="flex items-baseline justify-between">
+                <span className="text-xs text-slate-400">{t("command_center.connections")}</span>
+                <b className="tabular-nums">{enabledCount} / {agents.length || 23}</b>
+              </div>
+              <div className="flex items-baseline justify-between">
+                <span className="text-xs text-slate-400">{t("command_center.events_per_min")}</span>
+                <b className="tabular-nums text-cyan-300">{eventsPerMin}</b>
+              </div>
+              <div className="h-1 overflow-hidden rounded-full bg-white/10">
+                <i
+                  className="block h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-700"
+                  style={{ width: `${Math.min(100, eventsPerMin * 8)}%` }}
                 />
-                <button
-                  type="submit"
-                  disabled={createGoal.isPending || !goalTitle.trim()}
-                  className="min-h-[44px] rounded-lg bg-emerald-500 px-5 text-sm font-semibold text-slate-950 transition-opacity disabled:opacity-40"
-                >
-                  {t("command_center.create_goal")}
-                </button>
               </div>
-            </form>
-
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
-              <div className="flex-1">
-                <VoiceCapture onConfirmed={(text) => setGoalTitle(text)} />
-              </div>
-              {capturedGoal ? (
-                <button
-                  type="button"
-                  onClick={() => requestPlan.mutate(capturedGoal.id)}
-                  disabled={requestPlan.isPending}
-                  className="min-h-[44px] rounded-lg border border-violet-400/40 bg-violet-500/10 px-4 text-sm font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:opacity-40"
-                >
-                  {t("command_center.request_plan")}
-                  <span className="block max-w-[26ch] truncate text-[11px] font-normal text-violet-300/70">
-                    {capturedGoal.title}
-                  </span>
-                </button>
-              ) : null}
             </div>
-          </div>
+          </section>
+
+          <section className="glass rounded-2xl p-4">
+            <h3 className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">
+              {t("command_center.voice_ptt")}
+            </h3>
+            <VoiceCapture onConfirmed={(text) => setGoalTitle(text)} />
+            {capturedGoal ? (
+              <button
+                type="button"
+                onClick={() => requestPlan.mutate(capturedGoal.id)}
+                disabled={requestPlan.isPending}
+                className="mt-3 w-full rounded-lg border border-violet-400/40 bg-violet-500/10 px-3 py-2 text-sm font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:opacity-40"
+              >
+                {t("command_center.request_plan")}
+                <span className="block max-w-full truncate text-[11px] font-normal text-violet-300/70">
+                  {capturedGoal.title}
+                </span>
+              </button>
+            ) : null}
+          </section>
+
+          <Link
+            href="/approvals"
+            className="glass flex flex-col gap-1 rounded-2xl p-4 transition-colors hover:bg-white/[0.05]"
+          >
+            <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">
+              {t("command_center.pending_approvals")}
+            </span>
+            <span className="text-3xl font-semibold tabular-nums">
+              {approvalsQuery.isLoading ? "…" : pendingApprovals.length}
+            </span>
+            {pendingApprovals.slice(0, 2).map((a) => (
+              <span key={a.id} className="truncate text-[11px] text-amber-200/80">
+                • {a.action}
+              </span>
+            ))}
+            <span className="text-xs text-emerald-300">{t("command_center.view_all")} →</span>
+          </Link>
         </div>
 
-        {/* Live conversation */}
-        <div className="glass flex min-h-[28rem] flex-col rounded-2xl p-4 xl:col-span-5 xl:h-auto">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-slate-200">
-              {t("command_center.conversation")}
-            </h2>
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee]" aria-hidden />
-          </div>
-          <ConversationStream agents={agents} />
+        {/* center: the neural board */}
+        <div className="order-1 min-w-0 xl:order-2">
+          <NeuralCommandBoard agents={agents} />
+        </div>
+
+        {/* side B: live feed + system metrics */}
+        <div className="order-3 flex min-w-0 flex-col gap-4">
+          <section className="glass rounded-2xl p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">
+                {t("command_center.live_feed")}
+              </h3>
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee]" aria-hidden />
+            </div>
+            <LiveFeed agents={agents} />
+          </section>
+
+          <section className="glass rounded-2xl p-4">
+            <h3 className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">
+              {t("command_center.system_health")}
+            </h3>
+            {healthQuery.isLoading ? (
+              <span className="text-sm text-slate-500">{t("common.loading")}</span>
+            ) : healthQuery.isError ? (
+              <span className="text-sm text-red-300">{t("common.error_generic")}</span>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {Object.entries(healthQuery.data || {}).map(([name, check]) => (
+                  <div key={name} className="flex items-center justify-between text-sm">
+                    <span className="capitalize text-slate-300">{name}</span>
+                    <span
+                      className={
+                        check.status === "ok"
+                          ? "rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs text-emerald-300"
+                          : "rounded-full bg-red-500/15 px-2 py-0.5 text-xs text-red-300"
+                      }
+                    >
+                      {check.status}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </div>
       </div>
 
-      {/* status strip */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <Link
-          href="/approvals"
-          className="glass flex flex-col gap-1 rounded-2xl p-4 transition-colors hover:bg-white/[0.05]"
-        >
-          <span className="text-xs font-medium text-slate-400">
-            {t("command_center.pending_approvals")}
-          </span>
-          <span className="text-3xl font-semibold">
-            {approvalsQuery.isLoading ? "…" : (approvalsQuery.data?.length ?? 0)}
-          </span>
-          <span className="text-xs text-emerald-300">{t("command_center.view_all")} →</span>
-        </Link>
+      {/* bottom command bar */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-stretch">
+        <form onSubmit={handleCreateGoal} className="glass flex flex-1 items-center gap-2 rounded-2xl p-2 ps-4">
+          <input
+            value={goalTitle}
+            onChange={(e) => setGoalTitle(e.target.value)}
+            placeholder={t("command_center.ask_placeholder")}
+            className="min-h-[44px] flex-1 bg-transparent text-sm outline-none placeholder:text-slate-500"
+          />
+          <button
+            type="submit"
+            disabled={createGoal.isPending || !goalTitle.trim()}
+            className="min-h-[44px] rounded-xl bg-gradient-to-l from-violet-500 to-blue-500 px-5 text-sm font-semibold text-white shadow-[0_0_14px_rgba(139,92,246,0.4)] transition-opacity disabled:opacity-40"
+          >
+            {t("command_center.create_goal")}
+          </button>
+        </form>
 
-        <div className="glass flex flex-col gap-2 rounded-2xl p-4">
-          <span className="text-xs font-medium text-slate-400">
-            {t("command_center.system_health")}
-          </span>
-          {healthQuery.isLoading ? (
-            <span className="text-sm text-slate-500">{t("common.loading")}</span>
-          ) : healthQuery.isError ? (
-            <span className="text-sm text-red-300">{t("common.error_generic")}</span>
-          ) : (
-            <div className="flex flex-col gap-1">
-              {Object.entries(healthQuery.data || {}).map(([name, check]) => (
-                <div key={name} className="flex items-center justify-between text-sm">
-                  <span className="capitalize text-slate-300">{name}</span>
-                  <span
-                    className={
-                      check.status === "ok"
-                        ? "rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs text-emerald-300"
-                        : "rounded-full bg-red-500/15 px-2 py-0.5 text-xs text-red-300"
-                    }
-                  >
-                    {check.status}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div className="flex flex-col justify-between gap-2 rounded-2xl border border-red-400/20 bg-red-500/[0.05] p-4">
-          <span className="text-xs font-medium text-red-200">
-            {t("command_center.emergency_stop")}
-          </span>
+        <div className="glass flex items-center gap-2 rounded-2xl p-2 px-3">
           {!confirmingStop ? (
             <button
               type="button"
               onClick={() => setConfirmingStop(true)}
-              className="min-h-[44px] rounded-lg border border-red-400/40 bg-red-500/10 text-sm font-semibold text-red-200"
+              className="min-h-[44px] rounded-xl border border-red-400/40 bg-red-500/10 px-4 text-sm font-semibold text-red-200"
             >
               {t("command_center.emergency_stop")}
             </button>
           ) : (
-            <div className="flex flex-col gap-2">
-              <p className="text-xs text-red-200">{t("command_center.emergency_stop_confirm")}</p>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setConfirmingStop(false);
-                    emergencyStop.mutate();
-                  }}
-                  className="min-h-[44px] flex-1 rounded-lg bg-red-500 text-sm font-semibold text-slate-950"
-                >
-                  {t("common.yes")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmingStop(false)}
-                  className="min-h-[44px] flex-1 rounded-lg border border-white/10 text-sm text-slate-300"
-                >
-                  {t("common.no")}
-                </button>
-              </div>
-            </div>
+            <>
+              <span className="text-xs text-red-200">{t("command_center.emergency_stop_confirm")}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmingStop(false);
+                  emergencyStop.mutate();
+                }}
+                className="min-h-[44px] rounded-xl bg-red-500 px-4 text-sm font-semibold text-slate-950"
+              >
+                {t("common.yes")}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmingStop(false)}
+                className="min-h-[44px] rounded-xl border border-white/10 px-4 text-sm text-slate-300"
+              >
+                {t("common.no")}
+              </button>
+            </>
           )}
         </div>
       </div>

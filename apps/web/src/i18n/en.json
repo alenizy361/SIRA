@@ -91,7 +91,12 @@
     "conversation": "Agent conversation",
     "conversation_hint": "Create a goal and request planning to watch the agents converse and execute live.",
     "thinking": "thinking…",
-    "core_stage": "Central core"
+    "core_stage": "Central core",
+    "core_status": "AI Core Status",
+    "connections": "Active Connections",
+    "events_per_min": "Events (last min)",
+    "live_feed": "Live Agent Feed",
+    "ask_placeholder": "Ask anything or give a command…"
   },
   "goals": {
     "title": "Goals",
