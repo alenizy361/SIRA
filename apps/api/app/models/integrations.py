@@ -63,6 +63,13 @@ class Budget(Base, OrgScopedMixin):
     monthly_max: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
     reserved_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
     spent_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+    # Fraction of monthly_max (0-100) at which a BUDGET_THRESHOLD_REACHED
+    # warning fires - before the hard stop, not instead of it.
+    warn_percent: Mapped[float] = mapped_column(Numeric(5, 2), default=80, nullable=False)
+    # Set the first time this budget crosses warn_percent, cleared whenever
+    # the cap is (re)configured - a fresh cap deserves a fresh warning cycle
+    # rather than staying silent forever because of a stale timestamp.
+    warned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class BudgetTransaction(Base):

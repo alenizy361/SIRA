@@ -432,55 +432,78 @@ def _make_is_cancelled(task_id: uuid.UUID, engine):
     return _is_cancelled
 
 
-def _org_budget_exceeded(db, org_id) -> bool:
-    """True only when an operator has actually configured an org-level
-    monthly cap (Budget.scope == "org") AND spend + reserved has reached it.
-    No Budget row at all means unconfigured - never gates anything, so this
-    is opt-in enforcement, not a silent default limit. Real dollar spend
-    comes from the CLI's own reported total_cost_usd (see cli_adapter's
-    "cost" event and _commit_run_cost below) - not an estimate."""
+def _relevant_budgets(db, org_id, agent_key: str | None):
+    """Every Budget row that gates this task: the org-wide cap plus (if
+    configured) a cap scoped to this specific agent. Modeled on Paperclip's
+    budget_policies, which key on (company, scope_type, scope_ref) so
+    company-wide and per-agent caps can both be active at once rather than
+    forcing a single flat limit."""
     from app.models.integrations import Budget
 
-    budget = (
-        db.query(Budget)
-        .filter(Budget.organization_id == org_id, Budget.scope == "org")
-        .first()
-    )
-    if budget is None or float(budget.monthly_max) <= 0:
-        return False
-    return float(budget.spent_amount) + float(budget.reserved_amount) >= float(budget.monthly_max)
+    filters = [Budget.organization_id == org_id, Budget.scope == "org"]
+    query = db.query(Budget).filter(*filters)
+    budgets = list(query.all())
+    if agent_key:
+        agent_budget = (
+            db.query(Budget)
+            .filter(Budget.organization_id == org_id, Budget.scope == "agent", Budget.scope_ref == agent_key)
+            .first()
+        )
+        if agent_budget is not None:
+            budgets.append(agent_budget)
+    return budgets
 
 
-def _commit_run_cost(db, org_id, run_id: uuid.UUID, cost_usd) -> None:
-    """Records the CLI's real reported spend against the org's Budget row, if
-    one is configured. Idempotent per run (idempotency_key derived from
-    run_id) so re-processing the same run (e.g. after a crash mid-commit)
-    never double-counts its cost."""
+def _budget_gate(db, org_id, agent_key: str | None):
+    """Checks every relevant Budget row and returns (blocking_budget, warned)
+    - blocking_budget is the first Budget at/over its monthly cap (None if
+    none are), warned is the list of budgets newly crossing warn_percent this
+    call (each already flipped to warned_at=now so a later call won't
+    re-report the same crossing). No Budget row configured for a scope means
+    that scope is never gated - this is opt-in enforcement, not a silent
+    default limit."""
+    warned = []
+    blocking = None
+    for budget in _relevant_budgets(db, org_id, agent_key):
+        if float(budget.monthly_max) <= 0:
+            continue
+        used = float(budget.spent_amount) + float(budget.reserved_amount)
+        cap = float(budget.monthly_max)
+        if blocking is None and used >= cap:
+            blocking = budget
+            continue
+        if budget.warned_at is None and cap > 0 and used >= cap * (float(budget.warn_percent) / 100.0):
+            budget.warned_at = datetime.now(timezone.utc)
+            db.add(budget)
+            warned.append(budget)
+    return blocking, warned
+
+
+def _commit_run_cost(db, org_id, agent_key: str | None, run_id: uuid.UUID, cost_usd) -> None:
+    """Records the CLI's real reported spend against every relevant Budget
+    row (org-wide and, if configured, this agent's own). Idempotent per
+    (budget, run) pair so re-processing the same run (e.g. after a crash
+    mid-commit) never double-counts its cost, and a run charged against two
+    scopes doesn't collide on one idempotency key."""
     if not cost_usd:
         return
-    from app.models.integrations import Budget, BudgetTransaction
+    from app.models.integrations import BudgetTransaction
 
-    budget = (
-        db.query(Budget)
-        .filter(Budget.organization_id == org_id, Budget.scope == "org")
-        .first()
-    )
-    if budget is None:
-        return
-    idempotency_key = f"run-cost-{run_id}"
-    already_committed = (
-        db.query(BudgetTransaction.id)
-        .filter(BudgetTransaction.idempotency_key == idempotency_key)
-        .first()
-    )
-    if already_committed:
-        return
-    db.add(BudgetTransaction(
-        budget_id=budget.id, idempotency_key=idempotency_key, kind="commit",
-        amount=cost_usd, created_at=datetime.now(timezone.utc),
-    ))
-    budget.spent_amount = float(budget.spent_amount) + float(cost_usd)
-    db.add(budget)
+    for budget in _relevant_budgets(db, org_id, agent_key):
+        idempotency_key = f"run-cost-{run_id}-{budget.id}"
+        already_committed = (
+            db.query(BudgetTransaction.id)
+            .filter(BudgetTransaction.idempotency_key == idempotency_key)
+            .first()
+        )
+        if already_committed:
+            continue
+        db.add(BudgetTransaction(
+            budget_id=budget.id, idempotency_key=idempotency_key, kind="commit",
+            amount=cost_usd, created_at=datetime.now(timezone.utc),
+        ))
+        budget.spent_amount = float(budget.spent_amount) + float(cost_usd)
+        db.add(budget)
 
 
 def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
@@ -530,20 +553,41 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         core_state = CoreState.CODING if task.workspace_repo else CoreState.PLANNING
         publish_core_state(org_id, core_state, actor, str(task.id))
 
-        if _org_budget_exceeded(db, org_id):
-            # Refuse to spend a single further dollar once the org's monthly
-            # cap is hit - the CLI is never invoked. Reuses the same
-            # RUNNING->RETRY_WAIT path any other failure takes (auth blip,
-            # timeout, ...) rather than inventing a new FSM edge; the
-            # progression driver will keep retrying on its normal backoff,
-            # which naturally stops blocking once spend resets or the cap is
-            # raised. An org with no Budget row configured is never gated -
-            # this is opt-in enforcement, not a default limit nobody asked for.
-            logger.warning("Task %s blocked - organization %s is over its monthly budget", task.id, org_id)
+        blocking_budget, warned_budgets = _budget_gate(db, org_id, task.assigned_agent_key)
+        for wb in warned_budgets:
+            publish(
+                org_id, EventType.BUDGET_THRESHOLD_REACHED, actor, str(task.id),
+                payload={
+                    "scope": wb.scope, "scope_ref": wb.scope_ref,
+                    "spent_amount": float(wb.spent_amount), "monthly_max": float(wb.monthly_max),
+                    "warn_percent": float(wb.warn_percent),
+                },
+                entities=_task_entities(task, run),
+            )
+        db.commit()
+
+        if blocking_budget is not None:
+            # Refuse to spend a single further dollar once a relevant cap
+            # (org-wide or this agent's own) is hit - the CLI is never
+            # invoked. Reuses the same RUNNING->RETRY_WAIT path any other
+            # failure takes (auth blip, timeout, ...) rather than inventing a
+            # new FSM edge; the progression driver will keep retrying on its
+            # normal backoff, which naturally stops blocking once spend
+            # resets or the cap is raised. A scope with no Budget row
+            # configured is never gated - this is opt-in enforcement, not a
+            # default limit nobody asked for.
+            logger.warning(
+                "Task %s blocked - %s budget '%s' is over its monthly cap",
+                task.id, blocking_budget.scope, blocking_budget.scope_ref,
+            )
             run.state = "failed"
             run.finished_at = datetime.now(timezone.utc)
             db.add(run)
-            publish(org_id, EventType.TASK_BLOCKED, actor, str(task.id), payload={"reason": "budget_exceeded"}, entities=_task_entities(task, run))
+            publish(
+                org_id, EventType.TASK_BLOCKED, actor, str(task.id),
+                payload={"reason": "budget_exceeded", "scope": blocking_budget.scope, "scope_ref": blocking_budget.scope_ref},
+                entities=_task_entities(task, run),
+            )
             task.state = transition_task(TaskState(task.state), TaskState.RETRY_WAIT).value
             db.add(task)
             db.commit()
@@ -572,7 +616,7 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         # Spend is real the moment the CLI reports it - a cancelled, timed-out,
         # or failed run can still have burned real tokens, so this is recorded
         # unconditionally rather than only on the success path.
-        _commit_run_cost(db, org_id, run.id, result.cost_usd)
+        _commit_run_cost(db, org_id, task.assigned_agent_key, run.id, result.cost_usd)
 
         if result.cancelled and not result.timed_out:
             # A genuine operator-requested cancel (as opposed to a timeout,

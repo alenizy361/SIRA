@@ -385,6 +385,92 @@ def test_worker_stops_a_running_task_and_marks_it_cancelled_when_an_operator_req
     assert run.state == "cancelled"
 
 
+def test_task_is_blocked_when_the_assigned_agents_own_budget_is_exceeded(db, org_id, monkeypatch):
+    """Per-agent budgets must gate independently of the org-wide cap - an
+    org with plenty of headroom overall can still cut off one specific
+    over-spending agent (mirrors Paperclip's per-scope budget_policies)."""
+    from app.models.integrations import Budget
+    from app.models.work import Run, RunLease
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    db.add(Budget(organization_id=org_id, scope="org", scope_ref=str(org_id), monthly_max=1000, spent_amount=0))
+    db.add(Budget(
+        organization_id=org_id, scope="agent", scope_ref="frontend_engineer",
+        monthly_max=5, spent_amount=5,
+    ))
+    db.commit()
+
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None):
+        raise AssertionError("the CLI must not be invoked once this agent is over its own budget")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    task = _make_ready_task(db, org_id, agent_key="frontend_engineer")
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 0
+
+    db.refresh(task)
+    assert task.state == "retry_wait"
+    assert db.query(RunLease).filter(RunLease.task_id == task.id).count() == 0
+    run = db.query(Run).filter(Run.task_id == task.id).one()
+    assert run.state == "failed"
+
+
+def test_budget_warning_event_fires_once_at_the_threshold_without_blocking_the_task(db, org_id, monkeypatch):
+    """Crossing warn_percent (default 80%) must publish BUDGET_THRESHOLD_REACHED
+    and let the task run anyway - only the hard cap (100%) blocks execution.
+    A second run past the threshold must not re-fire the warning."""
+    import json
+
+    from app.config import get_settings
+    from app.models.integrations import Budget
+    from app.realtime.bus import EventBus
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+    from contracts.events import EventType
+
+    budget = Budget(organization_id=org_id, scope="org", scope_ref=str(org_id), monthly_max=10, spent_amount=8.5)
+    db.add(budget)
+    db.commit()
+    db.refresh(budget)
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    bus = EventBus(get_settings().redis_url)
+    pubsub = bus.pubsub(str(org_id))
+    pubsub.get_message(timeout=0.1)
+
+    task = _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 1  # not blocked - only warned
+
+    db.refresh(task)
+    assert task.state == "completed"
+    db.refresh(budget)
+    assert budget.warned_at is not None
+
+    found_warning = False
+    msg = pubsub.get_message(timeout=1.0)
+    while msg:
+        if msg.get("type") == "message":
+            payload = json.loads(msg["data"])
+            if payload["type"] == EventType.BUDGET_THRESHOLD_REACHED.value:
+                found_warning = True
+        msg = pubsub.get_message(timeout=1.0)
+    pubsub.close()
+    assert found_warning, "expected a budget.threshold.reached event"
+
+    # A second task, spend unchanged - must NOT warn again.
+    warned_at_first = budget.warned_at
+    task2 = _make_ready_task(db, org_id)
+    run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    db.refresh(budget)
+    assert budget.warned_at == warned_at_first
+
+
 def test_task_is_blocked_without_invoking_the_cli_once_org_budget_is_exceeded(db, org_id, monkeypatch):
     """Regression target: a Budget row existed in the schema with nothing
     ever enforcing it - an org could burn unlimited real dollars through the
@@ -462,5 +548,5 @@ def test_real_run_cost_is_committed_against_the_configured_budget(db, org_id, mo
 
     db.refresh(budget)
     assert float(budget.spent_amount) == 2.5
-    txn = db.query(BudgetTransaction).filter(BudgetTransaction.idempotency_key == f"run-cost-{run.id}").one()
+    txn = db.query(BudgetTransaction).filter(BudgetTransaction.idempotency_key == f"run-cost-{run.id}-{budget.id}").one()
     assert float(txn.amount) == 2.5

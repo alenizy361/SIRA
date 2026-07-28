@@ -55,6 +55,8 @@ def list_budgets(user: User = Depends(get_current_user), db: DbSession = Depends
             "monthly_max": float(b.monthly_max),
             "reserved_amount": float(b.reserved_amount),
             "spent_amount": float(b.spent_amount),
+            "warn_percent": float(b.warn_percent),
+            "warned": b.warned_at is not None,
             "remaining": max(0.0, float(b.monthly_max) - float(b.spent_amount) - float(b.reserved_amount))
             if float(b.monthly_max) > 0 else None,
         }
@@ -62,44 +64,62 @@ def list_budgets(user: User = Depends(get_current_user), db: DbSession = Depends
     ]
 
 
-class SetOrgBudgetRequest(BaseModel):
+class SetBudgetCapRequest(BaseModel):
+    scope: str  # "org" | "agent" - "project" is defined in the schema but has
+    # no corresponding first-class entity in Rabit yet, so it isn't exposed here.
+    agent_key: str | None = None
     monthly_max_usd: float
     daily_max_usd: float = 0
+    warn_percent: float = 80
 
 
-@router.post("/budgets/org-cap")
-def set_org_budget_cap(
-    body: SetOrgBudgetRequest,
+@router.post("/budgets/cap")
+def set_budget_cap(
+    body: SetBudgetCapRequest,
     user: User = Depends(get_current_user),
     db: DbSession = Depends(get_db),
 ):
-    """Upserts the org-wide monthly spend cap that claude_worker.worker's
-    _org_budget_exceeded enforces before every task run. Setting monthly_max_usd
-    to 0 turns enforcement back off (matches Budget's "no row / zero cap means
-    unconfigured" convention) rather than needing a separate delete path."""
+    """Upserts a Budget row that claude_worker.worker._budget_gate enforces
+    before every task run - scope="org" caps total org spend, scope="agent"
+    (with agent_key) caps that one agent's spend independently, and both can
+    be configured at once (mirrors Paperclip's per-scope budget_policies).
+    Setting monthly_max_usd to 0 turns enforcement back off for that scope
+    (matches Budget's "no row / zero cap means unconfigured" convention)
+    rather than needing a separate delete path. Any (re)configuration clears
+    warned_at so a raised or reset cap gets a fresh warning cycle instead of
+    staying silently past its old warning forever."""
+    if body.scope not in ("org", "agent"):
+        raise HTTPException(status_code=422, detail="scope must be 'org' or 'agent'")
+    if body.scope == "agent" and not body.agent_key:
+        raise HTTPException(status_code=422, detail="agent_key is required when scope='agent'")
     if body.monthly_max_usd < 0 or body.daily_max_usd < 0:
         raise HTTPException(status_code=422, detail="Budget caps cannot be negative")
+    if not (0 <= body.warn_percent <= 100):
+        raise HTTPException(status_code=422, detail="warn_percent must be between 0 and 100")
 
+    scope_ref = body.agent_key if body.scope == "agent" else str(user.organization_id)
     budget = (
         db.query(Budget)
-        .filter(Budget.organization_id == user.organization_id, Budget.scope == "org")
+        .filter(Budget.organization_id == user.organization_id, Budget.scope == body.scope, Budget.scope_ref == scope_ref)
         .first()
     )
     if budget is None:
-        budget = Budget(
-            organization_id=user.organization_id, scope="org", scope_ref=str(user.organization_id),
-            currency="USD",
-        )
+        budget = Budget(organization_id=user.organization_id, scope=body.scope, scope_ref=scope_ref, currency="USD")
     budget.currency = "USD"
     budget.monthly_max = body.monthly_max_usd
     budget.daily_max = body.daily_max_usd
+    budget.warn_percent = body.warn_percent
+    budget.warned_at = None
     db.add(budget)
     db.commit()
     db.refresh(budget)
     return {
         "id": str(budget.id),
+        "scope": budget.scope,
+        "scope_ref": budget.scope_ref,
         "monthly_max": float(budget.monthly_max),
         "daily_max": float(budget.daily_max),
+        "warn_percent": float(budget.warn_percent),
         "spent_amount": float(budget.spent_amount),
     }
 
