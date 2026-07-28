@@ -18,7 +18,9 @@ from app.db import get_db
 from app.models.company import Goal
 from app.models.governance import AuditLog
 from app.models.identity import User
+from app.realtime.publisher import publish, publish_core_state
 from app.services.planning import PlanningError, plan_goal
+from contracts.events import CoreState, EntityRef, EventType
 
 router = APIRouter(prefix="/goals", tags=["goals"])
 
@@ -64,6 +66,10 @@ def create_goal(payload: CreateGoalRequest, user: User = Depends(get_current_use
     db.commit()
     db.refresh(goal)
     _audit(db, user, "goal.create", str(goal.id), "executed", f"Goal '{payload.title}' captured")
+    publish(
+        user.organization_id, EventType.GOAL_CREATED, str(user.id), str(goal.id),
+        payload={"title": goal.title}, entities=[EntityRef(type="goal", id=str(goal.id))],
+    )
     return _goal_out(goal)
 
 
@@ -118,12 +124,19 @@ def create_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: 
     if goal.state != GoalState.GOAL_CAPTURED.value:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Goal already in state '{goal.state}'")
 
+    publish_core_state(user.organization_id, CoreState.PLANNING, "ceo", str(goal.id))
     try:
         plan = plan_goal(db, goal)
     except PlanningError as exc:
+        publish_core_state(user.organization_id, CoreState.WARNING, "ceo", str(goal.id))
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
 
     _audit(db, user, "goal.plan", str(goal.id), "executed", f"Plan '{plan.title}' drafted by CEO agent")
+    publish(
+        user.organization_id, EventType.PLAN_CREATED, "ceo", str(goal.id),
+        payload={"title": plan.title}, entities=[EntityRef(type="goal", id=str(goal.id)), EntityRef(type="plan", id=str(plan.id))],
+    )
+    publish_core_state(user.organization_id, CoreState.IDLE, "ceo", str(goal.id))
     return {
         "goal": _goal_out(goal),
         "plan": {"id": str(plan.id), "title": plan.title, "summary": plan.summary, "state": plan.state},

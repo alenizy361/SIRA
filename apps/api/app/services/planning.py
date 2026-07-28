@@ -27,6 +27,8 @@ from app.config import get_settings
 from app.models.agents import AgentDefinition
 from app.models.company import Goal
 from app.models.work import Plan, PlanStep, Task
+from app.realtime.publisher import publish
+from contracts.events import EntityRef, EventType
 
 PLAN_OUTPUT_SCHEMA = {
     "type": "object",
@@ -134,23 +136,37 @@ def plan_goal(db, goal: Goal) -> Plan:
     db.add(plan)
     db.flush()
 
+    created_tasks = []
     for i, item in enumerate(valid_tasks):
         db.add(PlanStep(plan_id=plan.id, sequence=i, title=item["title"], assigned_agent_key=item["agent_key"]))
-        db.add(
-            Task(
-                organization_id=goal.organization_id,
-                created_by=goal.created_by,
-                plan_id=plan.id,
-                title=item["title"],
-                description=item["description"],
-                assigned_agent_key=item["agent_key"],
-                risk_level=item["risk_level"],
-                state="ready",
-                idempotency_key=f"{goal.id}-plan-{plan.id}-{i}",
-                acceptance_criteria={"criteria": [], "allowed_tools": ["Read", "Edit"]},
-            )
+        task_row = Task(
+            organization_id=goal.organization_id,
+            created_by=goal.created_by,
+            plan_id=plan.id,
+            title=item["title"],
+            description=item["description"],
+            assigned_agent_key=item["agent_key"],
+            risk_level=item["risk_level"],
+            state="ready",
+            idempotency_key=f"{goal.id}-plan-{plan.id}-{i}",
+            acceptance_criteria={"criteria": [], "allowed_tools": ["Read", "Edit"]},
         )
+        db.add(task_row)
+        created_tasks.append(task_row)
 
     db.commit()
     db.refresh(plan)
+
+    for task_row in created_tasks:
+        db.refresh(task_row)
+        publish(
+            goal.organization_id, EventType.TASK_CREATED, task_row.assigned_agent_key, str(task_row.id),
+            payload={"title": task_row.title, "risk_level": task_row.risk_level},
+            entities=[
+                EntityRef(type="goal", id=str(goal.id)),
+                EntityRef(type="plan", id=str(plan.id)),
+                EntityRef(type="task", id=str(task_row.id)),
+            ],
+        )
+
     return plan

@@ -91,6 +91,49 @@ def test_parse_stream_line_captures_tool_call_and_redacts_secrets():
     assert event["input"]["command"] == "ls"
 
 
+def test_parse_stream_line_captures_tool_result():
+    import json
+
+    line = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_123",
+                        "is_error": False,
+                        "content": "file written successfully",
+                    }
+                ]
+            },
+        }
+    )
+    event = _parse_stream_line(line)
+    assert event["kind"] == "tool_result"
+    assert event["tool_use_id"] == "toolu_123"
+    assert event["is_error"] is False
+    assert "file written successfully" in event["content_preview"]
+
+
+def test_parse_stream_line_tool_result_error_flag():
+    import json
+
+    line = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_456", "is_error": True, "content": "permission denied"}
+                ]
+            },
+        }
+    )
+    event = _parse_stream_line(line)
+    assert event["kind"] == "tool_result"
+    assert event["is_error"] is True
+
+
 def test_parse_stream_line_text_fallback_for_non_json():
     event = _parse_stream_line("plain text output from an older CLI build")
     assert event["kind"] == "text_fallback"

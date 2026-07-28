@@ -400,6 +400,23 @@ def _parse_stream_line(line: str) -> Optional[dict]:
                 return {"kind": "tool_call", "tool_name": block.get("name"), "input": _redact(block.get("input", {}))}
             if block.get("type") == "text":
                 return {"kind": "final_text", "text": block.get("text", "")}
+    if msg_type == "user":
+        # Tool RESULTS arrive as a "user"-role message in the stream-json
+        # protocol (the CLI feeding the tool's output back to the model) -
+        # this is the completion signal paired with the "tool_call" kind
+        # above, needed to emit a run.tool.completed event alongside
+        # run.tool.started.
+        content = obj.get("message", {}).get("content", [])
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                raw_content = block.get("content", "")
+                preview = raw_content if isinstance(raw_content, str) else json.dumps(raw_content)
+                return {
+                    "kind": "tool_result",
+                    "tool_use_id": block.get("tool_use_id"),
+                    "is_error": bool(block.get("is_error", False)),
+                    "content_preview": preview[:500],
+                }
     if msg_type == "result":
         return {"kind": "final_text", "text": obj.get("result", "")}
     return {"kind": "other", "raw_type": msg_type}

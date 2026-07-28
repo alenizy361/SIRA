@@ -147,9 +147,37 @@ with `uvicorn` and exercised over real HTTP with `curl`.
   aspirational description.
   Known incomplete pieces (all show honest "not available yet" empty
   states rather than fake data): `/runs` and `/analytics` have no backend
-  endpoint yet; `core.state.changed` events aren't published by the
-  backend yet (see gap #2 below) so the sphere doesn't yet animate from
-  live agent activity, only from its own idle-state logic.
+  endpoint yet.
+
+- **The dashboard now genuinely reacts to real backend activity** (this
+  was gap #2 below - now closed). `apps/api/app/realtime/publisher.py` is
+  a shared, sequence-numbered publish path used by both
+  `services/claude-worker/claude_worker/worker.py` (task execution:
+  `task.assigned`/`task.started`/`task.progress`/`task.blocked`,
+  `run.tool.started`/`run.tool.completed` from the CLI's actual tool-use/
+  tool-result stream-json frames, `run.output.delta`, and
+  `core.state.changed` transitioning through `planning`/`coding` →
+  `reviewing` → `idle`/`paused`) and `apps/api/app/routers/goals.py` +
+  `app/services/planning.py` (`goal.created`, `plan.created`,
+  `task.created`, and `core.state.changed` bookending the real CEO-agent
+  planning call). Verified three ways: (1) a new integration test
+  (`tests/integration/test_worker_events.py`) subscribes to the real Redis
+  channel during a task execution and asserts the exact event types,
+  monotonically increasing sequence numbers, and correct entity
+  references arrive; (2) `tests/integration/test_goal_events.py` does the
+  same for `POST /goals`; (3) a genuine live-browser check: logged into
+  the real running dashboard via Playwright, called
+  `publish_core_state(org_id, CoreState.WARNING, ...)` directly against
+  the live API process from a separate script, and captured a screenshot
+  showing the AI core sphere change from teal/"خامل" (idle) to orange/
+  "تحذير" (warning) with **no page reload** - the WebSocket→Zustand
+  store→React re-render path the frontend agent built was already
+  correct and needed no changes; only the backend was missing the
+  publish calls. The frontend's `AICore.tsx` already had distinct visual
+  configs for every `CoreState` value now actually emitted.
+  Still open: the permission engine isn't yet consulted before these
+  actions execute (see gap below), and `run.output.delta` payloads are
+  short text deltas, not a full streamed transcript viewer.
 
 ## Dependency security scan
 
@@ -177,18 +205,11 @@ ships a patched release on the current major version.
 1. **No live VPS deployment.** `scripts/install.sh` has not been run for
    real anywhere - see "Environment reality" above. This requires a human
    to hand over SSH access to an actual server.
-2. **`services/claude-worker`'s poll loop is not wired to publish
-   `core.state.changed` / `run.output.delta` WebSocket events yet** - the
-   adapter's `on_event` callback exists and strips unsafe content
-   correctly, but nothing yet forwards those events into
-   `apps/api/app/realtime/bus.py`'s Redis channel. The dashboard's 3D core
-   will not yet animate from real backend activity until this wiring is
-   added - it is real infrastructure on both ends, just not connected.
-3. **No real third-party integrations** (GitHub, Vercel, Sentry, PostHog,
+2. **No real third-party integrations** (GitHub, Vercel, Sentry, PostHog,
    Google Analytics/Search Console/Ads, email, support platform, payment
    processor) - all correctly show `configured: false`. Wiring any of
    these requires the user to supply real credentials.
-4. **Voice experience and budgets/spend enforcement wiring into the
+3. **Voice experience and budgets/spend enforcement wiring into the
    permission engine at the API-route level are not yet connected** - the
    underlying pieces (permission-engine, budget model) are real and tested
    in isolation, but no route currently calls `PermissionEngine.evaluate()`
@@ -199,7 +220,7 @@ ships a patched release on the current major version.
    call the permission engine before executing a leased task - it trusts
    the task's `risk_level` column as already-classified. Both are real,
    scoped follow-ups, not aspirational.
-5. **`tests/security` now has 22 passing tests** (prompt-injection
+4. **`tests/security` now has 22 passing tests** (prompt-injection
    structural guarantees, command-injection/shell=True AST check,
    cross-organization data isolation with a second org inserted directly
    via SQL). Writing them **found and fixed a real path-traversal bug**:
@@ -214,7 +235,7 @@ ships a patched release on the current major version.
    `_safe_path_component()`. See `tests/security/test_command_injection.py`
    for the regression test. **`tests/load` is still empty** - no load
    tests written yet.
-6. Everything in this sandbox runs as **root** (the container's only user)
+5. Everything in this sandbox runs as **root** (the container's only user)
    rather than the non-root `aicompany` service account the constitution
    requires. The code (systemd units, claude-worker adapter) is written to
    run correctly as a non-root user in a real deployment; this sandbox
@@ -222,16 +243,13 @@ ships a patched release on the current major version.
 
 ## Exact next actions (in priority order)
 
-1. Wire `run.output.delta` / `core.state.changed` events from
-   `services/claude-worker` into `apps/api/app/realtime/bus.py` so the 3D
-   core reacts to real agent activity instead of only its own idle state.
-2. Wire the permission engine into the API/worker execution path: no route
+1. Wire the permission engine into the API/worker execution path: no route
    or worker task currently calls `PermissionEngine.evaluate()` before
    executing a mutating action - `packages/permission-engine` is real and
    tested in isolation but not yet consulted at the point of execution.
-3. Add `GET/POST /runs` and `GET /analytics` endpoints so those two
+2. Add `GET/POST /runs` and `GET /analytics` endpoints so those two
    dashboard pages stop showing "not available yet".
-4. Add `tests/load/` (currently empty) - basic WebSocket connection-count
+3. Add `tests/load/` (currently empty) - basic WebSocket connection-count
    and event-throughput tests.
-5. When a real VPS becomes available: run `scripts/doctor.sh` first, then
+4. When a real VPS becomes available: run `scripts/doctor.sh` first, then
    `scripts/install.sh`, then re-run `scripts/smoke-test.sh`.

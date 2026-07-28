@@ -2,6 +2,34 @@
 
 Format: date, decision, rationale. Newest first.
 
+## 2026-07-28 — One shared event publisher, not three ad-hoc ones
+
+**Decision:** Added `apps/api/app/realtime/publisher.py` as the single
+place that constructs and publishes a realtime `Event` (sequence number,
+Redis publish, replay-log append). Both `services/claude-worker` (task
+execution) and `apps/api/app/routers/goals.py` /
+`app/services/planning.py` (goal/plan/task creation) call into it rather
+than each hand-rolling `EventBus` calls.
+
+**Rationale:** `services/claude-worker` already imports `app.*` modules
+directly throughout this monorepo (see `worker.py`'s existing imports of
+`app.config`/`app.db`/`app.models`), so there was no reason to duplicate
+sequence-numbering/Redis-publish logic in a second module - one publisher
+function keeps the wire format, forbidden-payload-key check, and replay
+log behavior identical regardless of which side of the system triggered
+the event.
+
+**Rationale for what publishes what:** `core.state.changed` transitions
+follow the actual unit of work rather than a fixed timer -
+`planning`/`coding` while a Claude CLI call is in flight, `reviewing`
+immediately after, then `idle` (or `paused` on an authentication
+failure) - so the state always reflects genuine backend activity, never
+an animation loop decoupled from what's actually happening. Verified with
+a live browser check (not just an automated test): publishing a
+`CoreState.WARNING` event against the running API changed the actual
+rendered sphere color and Arabic state label in an already-open browser
+tab with no reload - see `docs/BUILD_STATUS.md`.
+
 ## 2026-07-28 — Dependency versions bumped after a real vulnerability scan
 
 **Decision:** `apps/api/requirements.txt`: removed `python-jose` (and its

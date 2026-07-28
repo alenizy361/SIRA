@@ -27,6 +27,8 @@ for p in [
 from app.config import get_settings  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
 from app.models.work import Task  # noqa: E402
+from app.realtime.publisher import publish, publish_core_state  # noqa: E402
+from contracts.events import CoreState, EntityRef, EventType  # noqa: E402
 from orchestrator.leasing import LeaseNotAcquired, acquire_lease, release_lease  # noqa: E402
 from orchestrator.scheduler import pick_ready_tasks  # noqa: E402
 from orchestrator.state_machine import TaskState, transition_task  # noqa: E402
@@ -81,8 +83,54 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
     return executed
 
 
+def _task_entities(task: Task, run=None) -> list[EntityRef]:
+    entities = [EntityRef(type="task", id=str(task.id))]
+    if run is not None:
+        entities.append(EntityRef(type="run", id=str(run.id)))
+    return entities
+
+
+def _forward_worker_event(organization_id, task: Task, run, event: dict) -> None:
+    """Translates a claude_worker.cli_adapter on_event dict (already sanitized
+    - no thinking/chain-of-thought content, secrets redacted) into a
+    published realtime event. This is the wiring that lets the dashboard's
+    3D core and live activity feed react to real agent activity instead of
+    just idling - constitution section 15's run.tool.started/completed and
+    run.output.delta events."""
+    kind = event.get("kind")
+    actor = task.assigned_agent_key or "claude-worker"
+    entities = _task_entities(task, run)
+
+    if kind == "tool_call":
+        publish(
+            organization_id, EventType.RUN_TOOL_STARTED, actor, str(task.id),
+            payload={"tool_name": event.get("tool_name"), "input": event.get("input", {})},
+            entities=entities,
+        )
+    elif kind == "tool_result":
+        publish(
+            organization_id, EventType.RUN_TOOL_COMPLETED, actor, str(task.id),
+            payload={
+                "tool_use_id": event.get("tool_use_id"),
+                "is_error": event.get("is_error", False),
+                "content_preview": event.get("content_preview", ""),
+            },
+            entities=entities,
+        )
+    elif kind in ("final_text", "text_fallback"):
+        publish(
+            organization_id, EventType.RUN_OUTPUT_DELTA, actor, str(task.id),
+            payload={"text": event.get("text", ""), "final": kind == "final_text"},
+            entities=entities,
+        )
+    # kind == "other" carries no safe/useful content - not forwarded.
+
+
 def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
     from app.models.work import Run
+
+    org_id = task.organization_id
+    actor = task.assigned_agent_key or "claude-worker"
 
     run = Run(organization_id=task.organization_id, task_id=task.id, agent_key=task.assigned_agent_key)
     db.add(run)
@@ -99,6 +147,7 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
     task.state = transition_task(TaskState(task.state), TaskState.ASSIGNED).value
     db.add(task)
     db.commit()
+    publish(org_id, EventType.TASK_ASSIGNED, actor, str(task.id), payload={"title": task.title}, entities=_task_entities(task, run))
 
     try:
         task.state = transition_task(TaskState(task.state), TaskState.RUNNING).value
@@ -106,9 +155,16 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         db.add(task)
         db.add(run)
         db.commit()
+        publish(org_id, EventType.TASK_STARTED, actor, str(task.id), entities=_task_entities(task, run))
+        core_state = CoreState.CODING if task.workspace_repo else CoreState.PLANNING
+        publish_core_state(org_id, core_state, actor, str(task.id))
 
         contract = _task_to_contract(task)
-        handle, wait = adapter.start_run(contract, run_id=str(run.id))
+        handle, wait = adapter.start_run(
+            contract,
+            run_id=str(run.id),
+            on_event=lambda ev: _forward_worker_event(org_id, task, run, ev),
+        )
         result = wait()
 
         run.exit_code = result.exit_code
@@ -119,16 +175,28 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         run.state = "validating" if result.exit_code == 0 and not result.timed_out else "failed"
         db.add(run)
 
-        next_state = TaskState.VALIDATING if run.state == "validating" else TaskState.RETRY_WAIT
+        publish_core_state(org_id, CoreState.REVIEWING, actor, str(task.id))
+        if run.state == "validating":
+            next_state = TaskState.VALIDATING
+            publish(org_id, EventType.TASK_PROGRESS, actor, str(task.id), payload={"stage": "validating"}, entities=_task_entities(task, run))
+        else:
+            next_state = TaskState.RETRY_WAIT
+            publish(org_id, EventType.TASK_BLOCKED, actor, str(task.id), payload={"reason": "run_failed_or_timed_out"}, entities=_task_entities(task, run))
         task.state = transition_task(TaskState(task.state), next_state).value
         db.add(task)
         db.commit()
+        publish_core_state(org_id, CoreState.IDLE, actor, str(task.id))
         return 1
     except AuthenticationRequiredError:
         logger.error("Claude CLI not authenticated - pausing this task, will retry once an operator logs in.")
         task.state = transition_task(TaskState(task.state), TaskState.BLOCKED).value
         db.add(task)
         db.commit()
+        publish_core_state(org_id, CoreState.PAUSED, actor, str(task.id))
+        publish(
+            org_id, EventType.TASK_BLOCKED, actor, str(task.id),
+            payload={"reason": "claude_cli_not_authenticated"}, entities=_task_entities(task, run),
+        )
         return 0
     finally:
         release_lease(db, task.id, worker_id=WORKER_ID)
