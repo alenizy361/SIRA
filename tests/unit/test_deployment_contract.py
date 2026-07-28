@@ -278,3 +278,30 @@ def test_expose_remote_url_extraction_regex_matches_real_cloudflared_output():
     )
     found = re.findall(pattern, sample)
     assert found and found[-1] == "https://random-adjective-noun-42.trycloudflare.com"
+
+
+def test_enable_phone_terminal_targets_the_invoking_user_not_root():
+    """SSH guidance must point at the human's own Linux account
+    ($SUDO_USER, set by sudo itself regardless of what it executes), never
+    at root - suggesting `ssh root@...` would be actively bad security advice."""
+    script = (REPO_ROOT / "scripts" / "enable-phone-terminal.sh").read_text()
+    assert "SUDO_USER" in script
+    assert "ssh ${TARGET_USER}@" in script
+
+
+def test_enable_phone_terminal_installs_ssh_server_before_tailscale():
+    """Tailscale's SSH feature still needs a real SSH server for password/key
+    auth; openssh-server must be installed first so the machine is at least
+    reachable on the LAN even before Tailscale is configured."""
+    script = (REPO_ROOT / "scripts" / "enable-phone-terminal.sh").read_text()
+    ssh_pos = script.index("openssh-server")
+    tailscale_pos = script.index("Installing Tailscale")
+    assert ssh_pos < tailscale_pos
+
+
+def test_enable_phone_terminal_ssh_install_is_noninteractive():
+    """A bare `apt-get install openssh-server` can hit a debconf prompt (e.g.
+    on a re-run with a modified sshd_config) and hang forever with no TTY to
+    answer it - DEBIAN_FRONTEND=noninteractive must be set."""
+    script = (REPO_ROOT / "scripts" / "enable-phone-terminal.sh").read_text()
+    assert "DEBIAN_FRONTEND=noninteractive" in script
