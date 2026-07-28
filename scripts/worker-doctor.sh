@@ -33,8 +33,36 @@ PROBLEMS=0
 NEED_LOGIN=0
 
 # ---------------------------------------------------------------------------
+# WHY did it stop? systemd records the exact outcome, which distinguishes the
+# cases that look identical from outside: an OOM kill (memory ceiling too low
+# for a real claude run), a non-zero exit (a crash - read the traceback), or a
+# latched start limit. Print this whether or not it is currently up, because a
+# unit that keeps dying and restarting looks "active" the moment you check.
+say "0/5 last exit reason"
+systemctl show "$UNIT" \
+  -p Result,ExecMainStatus,ExecMainCode,NRestarts,MemoryMax,MemoryPeak,ActiveState,SubState \
+  2>/dev/null | sed 's/^/  /'
+RESULT="$(systemctl show "$UNIT" -p Result --value 2>/dev/null || true)"
+case "$RESULT" in
+  oom-kill)
+    bad "The worker was OOM-KILLED: it hit its MemoryMax ceiling."
+    echo "     Fix: re-run scripts/install.sh - it now sizes MemoryMax to this host's RAM."
+    PROBLEMS=$((PROBLEMS+1)) ;;
+  start-limit-hit)
+    bad "systemd LATCHED this unit off after repeated failures (start-limit-hit)."
+    echo "     This script clears it below; the underlying crash still needs the fix above."
+    PROBLEMS=$((PROBLEMS+1)) ;;
+  signal)
+    warn "The worker was killed by a signal (often the kernel OOM killer)." ;;
+esac
+# Kernel-level OOM evidence, which systemd does not always attribute to the unit.
+if journalctl -k -n 300 --no-pager 2>/dev/null | grep -aiE "out of memory|oom-kill" | grep -aiE "claude|python" | tail -3 | grep -q .; then
+  bad "Kernel OOM killer has recently killed a claude/python process:"
+  journalctl -k -n 300 --no-pager 2>/dev/null | grep -aiE "out of memory|oom-kill" | tail -3 | sed 's/^/     /'
+  PROBLEMS=$((PROBLEMS+1))
+fi
+
 say "1/5 worker service"
-# ---------------------------------------------------------------------------
 if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
   ok "$UNIT is active"
 else
