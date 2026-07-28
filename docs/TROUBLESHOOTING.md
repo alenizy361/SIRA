@@ -63,3 +63,62 @@ reloading and abort on failure rather than leaving Nginx in a broken
 state. Check `infra/nginx/rabit-os.conf.template` was rendered with a
 real `$DOMAIN` value, and that ports 3000/8000 are actually listening
 locally before Nginx tries to proxy to them.
+
+## The dashboard still shows an OLD design after a successful install
+
+Symptom: `scripts/install.sh` finishes, smoke tests pass, but the browser
+still renders a previous version of the UI.
+
+This is almost always a **stale source checkout**, not a cache. The
+installer does **not** run `git pull`. It deploys whatever is in the
+checkout you launched it from (`REPO_ROOT`, i.e. the parent of the
+`scripts/` directory you invoked) and rsyncs it into `APP_ROOT`
+(`/opt/rabit-ai-company-os`). Two traps follow from that:
+
+1. **The clone is behind.** Re-running the installer from a checkout that
+   was never pulled redeploys the old commit perfectly successfully.
+2. **You ran the installer from `APP_ROOT` itself.** The rsync excludes
+   `.git`, so `/opt/rabit-ai-company-os` is *not* a git repo and can never
+   be updated with `git pull`. In that case `sync_repo_to_app_root` logs
+   "Already running from … — nothing to sync" and the same old code ships
+   forever.
+
+The installer now reports `Deploying commit: <sha> on <branch>` at the
+start, warns when the checkout is behind its upstream, writes
+`APP_ROOT/BUILD_INFO`, and prints `Deployed commit:` in the final summary.
+
+Diagnose which version is actually live:
+
+```bash
+cat /opt/rabit-ai-company-os/BUILD_INFO      # written by the installer
+docker image inspect --format '{{.Created}}' "$(docker compose -f /opt/rabit-ai-company-os/docker-compose.yml images -q web)"
+```
+
+Fix — pull in the real clone, then re-run **that clone's** installer:
+
+```bash
+find /root /home /opt /srv -maxdepth 4 -type d -name .git 2>/dev/null   # locate the clone
+CLONE=/root/SIRA                       # <- whatever you found
+git -C "$CLONE" fetch origin
+git -C "$CLONE" checkout <branch>
+git -C "$CLONE" pull origin <branch>
+git -C "$CLONE" log --oneline -1       # confirm the commit you expect
+sudo "$CLONE/scripts/install.sh"
+```
+
+If the UI still looks old, force a rebuild that cannot reuse a cached
+image layer, then recreate the container:
+
+```bash
+cd /opt/rabit-ai-company-os
+docker compose build --no-cache web
+docker compose up -d --force-recreate web
+```
+
+Verify from outside the box (substitute your host). The current UI ships a
+`space-backdrop` element and `/` performs a real 307 redirect:
+
+```bash
+curl -s http://<host>/command-center | grep -c space-backdrop   # expect > 0
+curl -s -o /dev/null -w '%{http_code}\n' http://<host>/          # expect 307
+```

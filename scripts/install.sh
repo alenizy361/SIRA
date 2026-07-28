@@ -42,6 +42,41 @@ log_step "Rabit AI Company OS installer starting"
 log_info "Repo checkout: ${REPO_ROOT}"
 log_info "Install target (APP_ROOT): ${APP_ROOT}"
 
+# Which commit is about to be deployed? This installer does NOT pull - it
+# deploys whatever is in REPO_ROOT right now. Stating the version up front
+# (and recording it in APP_ROOT/BUILD_INFO) is the difference between "the
+# install succeeded" and "the install succeeded and shipped what I think it
+# did" - a stale checkout otherwise reinstalls old code perfectly happily.
+SOURCE_COMMIT="unknown"
+SOURCE_BRANCH="unknown"
+report_source_version() {
+  if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    log_warn "${REPO_ROOT} is NOT a git checkout - cannot verify which version you are deploying."
+    log_warn "If this is ${APP_ROOT} itself, it never contains .git (the sync excludes it), so it"
+    log_warn "can never be updated with 'git pull'. Re-run this installer from a real git clone."
+    return
+  fi
+  SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  SOURCE_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  local dirty=""
+  [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]] && dirty=" (uncommitted changes present)"
+  log_info "Deploying commit: ${SOURCE_COMMIT} on ${SOURCE_BRANCH}${dirty}"
+
+  # Behind the remote? Then the operator almost certainly meant to pull first.
+  local upstream behind
+  upstream="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [[ -n "$upstream" ]]; then
+    git -C "$REPO_ROOT" fetch --quiet origin "$SOURCE_BRANCH" 2>/dev/null || true
+    behind="$(git -C "$REPO_ROOT" rev-list --count "HEAD..${upstream}" 2>/dev/null || echo 0)"
+    if [[ "${behind:-0}" -gt 0 ]]; then
+      log_warn "This checkout is ${behind} commit(s) BEHIND ${upstream}."
+      log_warn "You are about to deploy OLD code. Run this first, then re-run the installer:"
+      log_warn "    git -C ${REPO_ROOT} pull origin ${SOURCE_BRANCH}"
+    fi
+  fi
+}
+report_source_version
+
 # ---------------------------------------------------------------------------
 # 1. OS check (warn-only — we don't hard-fail on derivatives/newer point
 #    releases, but we do want the operator to know what was assumed)
@@ -231,6 +266,15 @@ sync_repo_to_app_root() {
 
   if [[ "$REPO_ROOT" == "$APP_ROOT" ]]; then
     log_ok "Already running from ${APP_ROOT} — nothing to sync"
+    # This is a silent-staleness trap: APP_ROOT never contains .git (the
+    # rsync below excludes it), so running the installer from here can only
+    # ever redeploy the code already sitting in APP_ROOT. Every re-run then
+    # "succeeds" while shipping the same old build forever.
+    if ! git -C "$APP_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+      log_warn "${APP_ROOT} has no .git, so this run CANNOT bring in newer code."
+      log_warn "To deploy an update: pull in a real clone and run that clone's installer, e.g."
+      log_warn "    git -C /root/SIRA pull origin <branch> && sudo /root/SIRA/scripts/install.sh"
+    fi
     return
   fi
 
@@ -245,6 +289,16 @@ sync_repo_to_app_root() {
     --exclude 'workspace' \
     "$REPO_ROOT"/ "$APP_ROOT"/
   log_ok "Synced application code into ${APP_ROOT}"
+
+  # Stamp what was actually deployed. APP_ROOT has no .git, so without this
+  # there is no way to tell on the server which commit is live.
+  {
+    echo "commit=${SOURCE_COMMIT}"
+    echo "branch=${SOURCE_BRANCH}"
+    echo "source=${REPO_ROOT}"
+    echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$APP_ROOT/BUILD_INFO"
+  log_info "Recorded deployed version in ${APP_ROOT}/BUILD_INFO (commit ${SOURCE_COMMIT})"
 }
 
 setup_directory_structure() {
@@ -619,7 +673,14 @@ main() {
   echo "  API:            ${API_URL}"
   echo "  App directory:  ${APP_ROOT}"
   echo "  Backups:        ${BACKUP_ROOT}"
+  echo "  Deployed commit: ${SOURCE_COMMIT} (${SOURCE_BRANCH})"
   echo ""
+  if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
+    echo "  NOTE: the deployed version could not be determined (source is not a git"
+    echo "  checkout). If the dashboard still shows an older UI than you expect, you"
+    echo "  are almost certainly re-deploying stale code - see the warnings above."
+    echo ""
+  fi
   if [[ "$CLAUDE_LOGIN_PENDING" == "true" ]]; then
     echo "  MANUAL STEP REQUIRED:"
     echo "    The Claude worker cannot run yet — authenticate the aicompany OS"
