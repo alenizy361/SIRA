@@ -112,6 +112,14 @@ with `uvicorn` and exercised over real HTTP with `curl`.
   now pass** (`pytest tests/unit tests/integration tests/security`,
   excluding the two real-CLI-invoking tests kept manual-run-once to avoid
   spending Claude usage on every CI run).
+- **Emergency stop now actually stops new task assignment**, not just
+  existing leases: `services/claude-worker/claude_worker/worker.py`'s poll
+  loop now skips any organization whose `autonomy_mode` isn't
+  `execute_low_risk`/`controlled_autonomous`, so a fresh `POST
+  /system/emergency-stop` (which sets `observe_only`) blocks brand-new
+  READY tasks too, not just ones that already held a lease. Regression
+  test: `tests/integration/test_worker_poll.py::test_emergency_stop_autonomy_mode_blocks_new_task_assignment`.
+  73 automated tests pass total now.
 
 ## In progress
 

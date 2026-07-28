@@ -89,3 +89,30 @@ def test_poll_tick_skips_task_over_concurrency_ceiling(db, org_id, monkeypatch):
     _make_ready_task(db, org_id)
     executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 0})
     assert executed == 0
+
+
+def test_emergency_stop_autonomy_mode_blocks_new_task_assignment(db, org_id, monkeypatch):
+    """Regression test for the emergency-stop gap: POST /system/emergency-stop
+    sets autonomy_mode to observe_only, and a freshly-created READY task
+    (which has no lease yet) must not be picked up by the poll loop while
+    that mode is set - revoking existing leases alone is not sufficient."""
+    from app.models.identity import Organization
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    org = db.get(Organization, org_id)
+    org.autonomy_mode = "observe_only"
+    db.add(org)
+    db.commit()
+
+    _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 0
+
+    org.autonomy_mode = "execute_low_risk"
+    db.add(org)
+    db.commit()
+    executed_after_resume = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed_after_resume == 1

@@ -57,13 +57,24 @@ def _task_to_contract(task: Task) -> TaskContract:
     )
 
 
+# Autonomy modes that permit the poll loop to pick up new work. Emergency
+# stop (POST /system/emergency-stop) sets an organization to "observe_only",
+# which must actually stop new task assignment here - constitution section
+# 22: "Emergency stop must immediately: stop new task assignment..." -
+# revoking leases alone (which the API route does) is not enough on its
+# own without this check, since a fresh READY task has no lease yet.
+AUTONOMOUS_EXECUTION_MODES = {"execute_low_risk", "controlled_autonomous"}
+
+
 def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str, int]) -> int:
     """Runs a single poll tick across all organizations. Returns the number
     of tasks executed (0 on an idle tick - this is the common case)."""
     from app.models.identity import Organization
 
     executed = 0
-    for (org_id,) in db.query(Organization.id).all():
+    for org_id, autonomy_mode in db.query(Organization.id, Organization.autonomy_mode).all():
+        if autonomy_mode not in AUTONOMOUS_EXECUTION_MODES:
+            continue
         ready = pick_ready_tasks(db, org_id, agent_concurrency_limits)
         for task in ready:
             executed += _execute_task(db, adapter, task)
