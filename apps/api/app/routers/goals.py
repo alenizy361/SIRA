@@ -202,7 +202,7 @@ def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db
     the answer - the WS event stream is only the live narration; this
     endpoint is the record that survives a reload and tells the operator
     plainly what the company decided to do and what came of it."""
-    from app.models.work import Plan, Run, Task
+    from app.models.work import Plan, Run, Task, ToolCall
 
     goal = db.get(Goal, goal_id)
     if not goal or goal.organization_id != user.organization_id:
@@ -231,7 +231,7 @@ def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db
     # One query for every task's latest run rather than N+1 - a real
     # difference once a plan has several tasks each with retries.
     task_ids = [t.id for t in tasks]
-    latest_result_by_task: dict = {}
+    latest_run_by_task: dict = {}
     if task_ids:
         runs = (
             db.query(Run)
@@ -240,7 +240,31 @@ def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db
             .all()
         )
         for r in runs:
-            latest_result_by_task.setdefault(r.task_id, r.result_summary)
+            latest_run_by_task.setdefault(r.task_id, r)
+
+    # The transparent "work log" - what tool was called, with what input, what
+    # it returned - for each task's latest run. This is the durable trace that
+    # survives a reload, matching how LangSmith/Devin-style agent UIs treat
+    # step-by-step transparency as core, not optional; before this, tool-call
+    # data only ever existed on the transient WS stream.
+    latest_run_ids = [r.id for r in latest_run_by_task.values()]
+    tool_calls_by_run: dict = {}
+    if latest_run_ids:
+        calls = (
+            db.query(ToolCall)
+            .filter(ToolCall.run_id.in_(latest_run_ids))
+            .order_by(ToolCall.run_id, ToolCall.started_at.asc())
+            .all()
+        )
+        for c in calls:
+            tool_calls_by_run.setdefault(c.run_id, []).append(
+                {
+                    "tool_name": c.tool_name,
+                    "input": c.input_summary,
+                    "output_preview": (c.output_summary or {}).get("preview"),
+                    "succeeded": c.succeeded,
+                }
+            )
 
     all_terminal = bool(tasks) and all(t.state in ("completed", "cancelled") for t in tasks)
 
@@ -259,7 +283,8 @@ def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db
                 "agent_key": t.assigned_agent_key,
                 "risk_level": t.risk_level,
                 "state": t.state,
-                "result": latest_result_by_task.get(t.id) or None,
+                "result": (latest_run_by_task.get(t.id).result_summary if t.id in latest_run_by_task else None),
+                "work_log": tool_calls_by_run.get(latest_run_by_task[t.id].id, []) if t.id in latest_run_by_task else [],
             }
             for t in tasks
         ],

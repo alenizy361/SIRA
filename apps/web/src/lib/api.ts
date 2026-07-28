@@ -161,6 +161,13 @@ export const agentsApi = {
   list: () => api.get<Agent[]>("/agents"),
 };
 
+export interface WorkLogEntry {
+  tool_name: string;
+  input: Record<string, unknown>;
+  output_preview: string | null;
+  succeeded: boolean | null;
+}
+
 export interface PlanTask {
   id: string;
   title: string;
@@ -171,6 +178,10 @@ export interface PlanTask {
   /** What the agent actually reported after its run - the real "what did it
    *  do", not just a state label. Null until a run has produced output. */
   result: string | null;
+  /** The transparent step-by-step trace: every tool the agent called, with
+   *  what input and what came back - the durable "work log", not just a
+   *  final summary. Empty until the run has made at least one tool call. */
+  work_log: WorkLogEntry[];
 }
 
 export interface GoalPlan {

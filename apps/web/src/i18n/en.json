@@ -124,7 +124,8 @@
     "resumed": "Company resumed — agents are working again",
     "resume_failed": "Could not resume",
     "goal_all_done": "Goal fully done — every task finished",
-    "agent_result": "What the agent produced"
+    "agent_result": "What the agent produced",
+    "work_log": "Work log (step by step)"
   },
   "goals": {
     "title": "Goals",

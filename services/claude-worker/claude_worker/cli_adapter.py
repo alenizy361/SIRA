@@ -504,7 +504,16 @@ def _parse_stream_line(line: str) -> list[dict]:
             if btype in THINKING_BLOCK_TYPES:
                 continue
             if btype == "tool_use":
-                events.append({"kind": "tool_call", "tool_name": block.get("name"), "input": _redact(block.get("input", {}))})
+                # id correlates this call with its later tool_result (which
+                # carries the same value as tool_use_id) - needed to persist a
+                # durable, matched work-log entry (constitution transparency:
+                # what tool was called, with what input, what it returned).
+                events.append({
+                    "kind": "tool_call",
+                    "id": block.get("id"),
+                    "tool_name": block.get("name"),
+                    "input": _redact(block.get("input", {})),
+                })
             elif btype == "text":
                 # The model's own prose is also untrusted - it can echo a
                 # secret it just read (e.g. summarizing a .env). Scrub it too.

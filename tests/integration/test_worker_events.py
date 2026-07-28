@@ -110,3 +110,52 @@ def test_task_execution_publishes_real_events_over_redis_pubsub(db, org_id, monk
     sequences = [e["sequence"] for e in received]
     assert sequences == sorted(sequences)
     assert len(set(sequences)) == len(sequences)
+
+
+def _fake_start_run_with_correlated_tool_call(self, contract, run_id=None, on_event=None):
+    class _Handle:
+        cancelled = False
+
+        def cancel(self):
+            pass
+
+    def _wait():
+        if on_event:
+            on_event({"kind": "tool_call", "id": "toolu_01abc", "tool_name": "Read", "input": {"file_path": "app.py"}})
+            on_event({
+                "kind": "tool_result", "tool_use_id": "toolu_01abc",
+                "is_error": False, "content_preview": "def main(): ...",
+            })
+            on_event({"kind": "final_text", "text": "Read the file."})
+        return _FakeRunResult(contract.task_id, run_id)
+
+    return _Handle(), _wait
+
+
+def test_tool_calls_are_persisted_as_a_durable_work_log(db, org_id, monkeypatch):
+    """Regression: a ToolCall table existed in the schema with nothing ever
+    writing to it - tool-call data only ever lived on the transient WS
+    stream, lost on reload. Every tool_call/tool_result pair must land as a
+    matched, durable ToolCall row - correlated by the tool_use id, not just
+    two disconnected rows."""
+    from app.models.work import Run, ToolCall
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run_with_correlated_tool_call)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    task = _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 1
+
+    run = db.query(Run).filter(Run.task_id == task.id).one()
+    calls = db.query(ToolCall).filter(ToolCall.run_id == run.id).all()
+    assert len(calls) == 1, "tool_call and tool_result must merge into ONE correlated row, not two"
+
+    call = calls[0]
+    assert call.tool_name == "Read"
+    assert call.input_summary == {"file_path": "app.py"}
+    assert call.output_summary == {"preview": "def main(): ..."}
+    assert call.succeeded is True
+    assert call.finished_at is not None

@@ -142,6 +142,43 @@ export function GoalPlanPanel({
                     </p>
                   </div>
                 ) : null}
+                {task.work_log.length > 0 ? (
+                  <details className="mt-2 rounded-lg border border-white/8 bg-black/10 open:bg-black/20">
+                    <summary className="cursor-pointer select-none px-2 py-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-slate-500 hover:text-slate-300">
+                      {t("command_center.work_log")} · {task.work_log.length}
+                    </summary>
+                    <div className="flex flex-col gap-1 px-2 pb-2">
+                      {task.work_log.map((step, si) => {
+                        const inputPreview = Object.entries(step.input || {})
+                          .map(([k, v]) => `${k}=${String(v).slice(0, 60)}`)
+                          .join(" · ");
+                        return (
+                          <div key={si} className="rounded border border-white/5 bg-white/[0.02] px-2 py-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className="h-1.5 w-1.5 rounded-full"
+                                style={{
+                                  background:
+                                    step.succeeded === false ? "#fb7185" : step.succeeded === true ? "#34d399" : "#94a3b8",
+                                }}
+                                aria-hidden
+                              />
+                              <span className="font-mono text-[11px] font-semibold text-slate-300">{step.tool_name}</span>
+                            </div>
+                            {inputPreview ? (
+                              <p className="mt-0.5 truncate font-mono text-[10.5px] text-slate-500">{inputPreview}</p>
+                            ) : null}
+                            {step.output_preview ? (
+                              <p className="mt-0.5 whitespace-pre-wrap break-words text-[10.5px] text-slate-500">
+                                {step.output_preview.slice(0, 240)}
+                              </p>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </details>
+                ) : null}
                 <div className="mt-2 flex items-center gap-2">
                   <span
                     className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"

@@ -335,3 +335,64 @@ def test_goal_plan_endpoint_surfaces_each_agents_actual_result(client):
     assert resp["all_done"] is True
     t = resp["tasks"][0]
     assert t["result"] == "Fixed the null check in payment_handler.py; added a regression test."
+
+
+def test_goal_plan_endpoint_surfaces_the_transparent_work_log(client):
+    """A ToolCall table existed with nothing ever writing to it - tool-call
+    data only ever lived on the transient WS stream. /goals/{id}/plan must
+    surface each task's matched tool_call/tool_result pairs as a durable,
+    ordered work_log - the step-by-step transparency real agent UIs
+    (LangSmith traces, Devin's work log) treat as core, not optional."""
+    import uuid as _uuid
+    from datetime import datetime, timedelta, timezone
+
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+    from app.models.work import Plan, Run, Task, ToolCall
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    goal = client.post(
+        "/goals",
+        json={"title": "Refactor the parser", "description": "d"},
+    ).json()
+    goal_id = goal["id"]
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    plan = Plan(organization_id=org_id, goal_id=_uuid.UUID(goal_id), title="Parser refactor", state="drafted")
+    db.add(plan)
+    db.flush()
+    task = Task(
+        organization_id=org_id, plan_id=plan.id, title="Refactor tokenizer",
+        description="d", assigned_agent_key="backend_engineer", risk_level="R1",
+        state="completed", idempotency_key=f"{goal_id}-wl", acceptance_criteria={},
+    )
+    db.add(task)
+    db.flush()
+    run = Run(organization_id=org_id, task_id=task.id, agent_key="backend_engineer", result_summary="Refactored.")
+    db.add(run)
+    db.flush()
+    t0 = datetime.now(timezone.utc)
+    db.add(ToolCall(
+        run_id=run.id, tool_name="Read", input_summary={"file_path": "tokenizer.py"},
+        output_summary={"preview": "class Tokenizer: ..."}, succeeded=True,
+        started_at=t0, finished_at=t0 + timedelta(seconds=1),
+    ))
+    db.add(ToolCall(
+        run_id=run.id, tool_name="Edit", input_summary={"file_path": "tokenizer.py"},
+        output_summary={"preview": "applied"}, succeeded=True,
+        started_at=t0 + timedelta(seconds=2), finished_at=t0 + timedelta(seconds=3),
+    ))
+    db.commit()
+    db.close()
+
+    resp = client.get(f"/goals/{goal_id}/plan").json()
+    log = resp["tasks"][0]["work_log"]
+    assert len(log) == 2
+    assert log[0]["tool_name"] == "Read"  # chronological order preserved
+    assert log[1]["tool_name"] == "Edit"
+    assert log[0]["output_preview"] == "class Tokenizer: ..."
+    assert log[0]["succeeded"] is True

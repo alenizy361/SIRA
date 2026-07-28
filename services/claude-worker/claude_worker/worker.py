@@ -27,13 +27,14 @@ for p in [
 
 from app.config import get_settings  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
-from app.models.work import Task  # noqa: E402
+from app.models.work import Task, ToolCall  # noqa: E402
 from app.realtime.publisher import publish, publish_core_state  # noqa: E402
 from contracts.events import CoreState, EntityRef, EventType  # noqa: E402
 from orchestrator.leasing import LeaseNotAcquired, acquire_lease, expire_stale_leases, release_lease  # noqa: E402
 from orchestrator.progression import advance_ready_pipeline  # noqa: E402
 from orchestrator.scheduler import pick_ready_tasks  # noqa: E402
 from orchestrator.state_machine import GoalState, InvalidTransition, TaskState, transition_goal, transition_task  # noqa: E402
+from sqlalchemy.orm import Session as OrmSession  # noqa: E402
 
 from .cli_adapter import AuthenticationRequiredError, ClaudeCodeAdapter
 from .task_contract import TaskContract
@@ -311,13 +312,30 @@ def _task_entities(task: Task, run=None) -> list[EntityRef]:
     return entities
 
 
-def _forward_worker_event(organization_id, task: Task, run, event: dict) -> None:
+def _forward_worker_event(organization_id, task: Task, run, event: dict, tool_call_ids: dict, engine) -> None:
     """Translates a claude_worker.cli_adapter on_event dict (already sanitized
     - no thinking/chain-of-thought content, secrets redacted) into a
-    published realtime event. This is the wiring that lets the dashboard's
-    3D core and live activity feed react to real agent activity instead of
-    just idling - constitution section 15's run.tool.started/completed and
-    run.output.delta events."""
+    published realtime event, AND persists a durable ToolCall row - the
+    transparent "work log" (what tool was called, with what input, what it
+    returned) that industry agent UIs (LangSmith traces, Devin's work log)
+    treat as core transparency, not optional. Before this, tool-call data only
+    ever existed on the transient Redis pub/sub stream - lost the moment you
+    reloaded the page, even though the ToolCall table existed in the schema
+    the whole time with nothing ever writing to it.
+
+    IMPORTANT: this runs on the CLI adapter's background stdout-pump THREAD
+    (joined with only a 2s timeout, so genuinely concurrent with the caller),
+    while the caller's `db` session is a live SQLAlchemy Session - NOT
+    thread-safe to share. Every write here opens its own short-lived session -
+    bound to the SAME `engine` the caller's session already uses (passed in
+    explicitly), never a freshly resolved get_sessionmaker(). Engines (unlike
+    Sessions) are safe to share across threads; resolving a second one via
+    get_settings() risks silently targeting a DIFFERENT database than the
+    caller if DATABASE_URL differs between the two resolution points (a real
+    bug this shipped with: it produced a ForeignKeyViolation in tests where
+    the test's engine and the global cached one pointed at different
+    databases - the caller's own bind removes that class of bug entirely).
+    """
     kind = event.get("kind")
     actor = task.assigned_agent_key or "claude-worker"
     entities = _task_entities(task, run)
@@ -328,6 +346,26 @@ def _forward_worker_event(organization_id, task: Task, run, event: dict) -> None
             payload={"tool_name": event.get("tool_name"), "input": event.get("input", {})},
             entities=entities,
         )
+        session = OrmSession(bind=engine)
+        try:
+            tc = ToolCall(
+                run_id=run.id,
+                tool_name=event.get("tool_name") or "unknown",
+                input_summary=event.get("input") or {},
+                output_summary={},
+                started_at=datetime.now(timezone.utc),
+            )
+            session.add(tc)
+            session.commit()
+            session.refresh(tc)
+            tool_use_id = event.get("id")
+            if tool_use_id:
+                tool_call_ids[tool_use_id] = tc.id
+        except Exception:  # noqa: BLE001
+            logger.debug("failed to persist ToolCall row", exc_info=True)
+            session.rollback()
+        finally:
+            session.close()
     elif kind == "tool_result":
         publish(
             organization_id, EventType.RUN_TOOL_COMPLETED, actor, str(task.id),
@@ -338,6 +376,22 @@ def _forward_worker_event(organization_id, task: Task, run, event: dict) -> None
             },
             entities=entities,
         )
+        tc_id = tool_call_ids.pop(event.get("tool_use_id"), None) if event.get("tool_use_id") else None
+        if tc_id:
+            session = OrmSession(bind=engine)
+            try:
+                tc = session.get(ToolCall, tc_id)
+                if tc:
+                    tc.output_summary = {"preview": event.get("content_preview", "")}
+                    tc.succeeded = not event.get("is_error", False)
+                    tc.finished_at = datetime.now(timezone.utc)
+                    session.add(tc)
+                    session.commit()
+            except Exception:  # noqa: BLE001
+                logger.debug("failed to update ToolCall row", exc_info=True)
+                session.rollback()
+            finally:
+                session.close()
     elif kind in ("final_text", "text_fallback"):
         publish(
             organization_id, EventType.RUN_OUTPUT_DELTA, actor, str(task.id),
@@ -395,10 +449,14 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         publish_core_state(org_id, core_state, actor, str(task.id))
 
         contract = _task_to_contract(task)
+        # Correlates a tool_call to its later tool_result so the persisted
+        # ToolCall row gets updated in place rather than duplicated - local to
+        # this one run, not shared across tasks.
+        tool_call_ids: dict[str, uuid.UUID] = {}
         handle, wait = adapter.start_run(
             contract,
             run_id=str(run.id),
-            on_event=lambda ev: _forward_worker_event(org_id, task, run, ev),
+            on_event=lambda ev: _forward_worker_event(org_id, task, run, ev, tool_call_ids, db.get_bind()),
         )
         result = wait()
 
