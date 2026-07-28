@@ -60,6 +60,49 @@ def test_health_endpoints_real(client):
     assert ready["checks"]["redis"]["status"] == "ok"
 
 
+def test_worker_health_reflects_heartbeat(client):
+    """The dashboard's "is the company running?" banner is driven entirely by
+    this endpoint, so it must faithfully report: down (no heartbeat), asleep
+    (heartbeat present but not authed), running (heartbeat + authed)."""
+    import json
+
+    import redis
+
+    from app.config import get_settings
+    from app.routers.health import WORKER_HEARTBEAT_KEY
+
+    r = redis.from_url(get_settings().redis_url)
+
+    # No heartbeat -> worker down, with a restart hint.
+    r.delete(WORKER_HEARTBEAT_KEY)
+    down = client.get("/health/worker").json()
+    assert down["alive"] is False and down["authed"] is False
+    assert "hint" in down
+
+    # Heartbeat present but not authenticated -> asleep, with a login hint.
+    from datetime import datetime, timezone
+
+    r.set(
+        WORKER_HEARTBEAT_KEY,
+        json.dumps({"worker_id": "test", "authed": False, "ts": datetime.now(timezone.utc).isoformat()}),
+        ex=60,
+    )
+    asleep = client.get("/health/worker").json()
+    assert asleep["alive"] is True and asleep["authed"] is False
+    assert "claude auth login" in asleep["hint"]
+
+    # Heartbeat present and authenticated -> running, no hint needed.
+    r.set(
+        WORKER_HEARTBEAT_KEY,
+        json.dumps({"worker_id": "test", "authed": True, "ts": datetime.now(timezone.utc).isoformat()}),
+        ex=60,
+    )
+    running = client.get("/health/worker").json()
+    assert running["alive"] is True and running["authed"] is True
+    assert running.get("seconds_since_heartbeat") is not None
+    r.delete(WORKER_HEARTBEAT_KEY)
+
+
 def test_agents_seeded_at_startup(client):
     resp = client.get("/agents")
     # Unauthenticated - should be 401 since /agents requires a session.

@@ -96,7 +96,14 @@
     "connections": "الوكلاء المتصلون",
     "events_per_min": "أحداث آخر دقيقة",
     "live_feed": "خلاصة الوكلاء الحية",
-    "ask_placeholder": "اسأل أي شيء أو أعطِ أمرًا للشركة…"
+    "ask_placeholder": "اسأل أي شيء أو أعطِ أمرًا للشركة…",
+    "worker_running": "الشركة تعمل — الوكلاء جاهزون للاستجابة",
+    "worker_running_lag": "الشركة تعمل (آخر نبضة قبل {seconds} ثانية)",
+    "worker_asleep": "الوكلاء نائمون — جلسة Claude غير مُسجّلة الدخول",
+    "worker_asleep_hint": "على الخادم شغّل: sudo -u aicompany -H claude auth login",
+    "worker_down": "مُشغّل الشركة متوقف — لن يحدث أي تفاعل",
+    "worker_down_hint": "على الخادم شغّل: systemctl restart rabit-claude-worker.service",
+    "worker_checking": "جارٍ فحص حالة الشركة…"
   },
   "goals": {
     "title": "الأهداف",

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { useI18n } from "@/i18n/I18nProvider";
 import { useToast } from "@/components/ToastProvider";
 import { NeuralCommandBoard } from "@/components/NeuralCommandBoard";
@@ -19,7 +19,90 @@ import {
   systemApi,
   ApiError,
   type Goal,
+  type WorkerStatus,
 } from "@/lib/api";
+
+/** Honest, always-visible answer to "will anything happen when I send a
+ *  command?". Three states from the host worker's Redis heartbeat:
+ *  running (green) / asleep-not-authed (amber) / down (red). */
+function WorkerBanner({
+  query,
+}: {
+  query: UseQueryResult<WorkerStatus, unknown>;
+}) {
+  const { t } = useI18n();
+
+  // Still fetching the very first time, or the endpoint isn't in this build
+  // yet (older API) - stay quiet rather than crying wolf.
+  if (query.isLoading) {
+    return (
+      <div className="glass flex items-center gap-3 rounded-2xl px-4 py-2.5 text-sm text-slate-400">
+        <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-slate-500" aria-hidden />
+        {t("command_center.worker_checking")}
+      </div>
+    );
+  }
+  const data = query.data;
+  if (!data) {
+    // /health/worker not available (404) - don't render a scary banner.
+    return null;
+  }
+
+  let tone: "ok" | "warn" | "bad";
+  let title: string;
+  let hint: string | null = null;
+
+  if (!data.alive) {
+    tone = "bad";
+    title = t("command_center.worker_down");
+    hint = t("command_center.worker_down_hint");
+  } else if (!data.authed) {
+    tone = "warn";
+    title = t("command_center.worker_asleep");
+    hint = t("command_center.worker_asleep_hint");
+  } else {
+    tone = "ok";
+    const lag = data.seconds_since_heartbeat ?? 0;
+    title =
+      lag > 45
+        ? t("command_center.worker_running_lag").replace("{seconds}", String(lag))
+        : t("command_center.worker_running");
+  }
+
+  const styles: Record<typeof tone, { border: string; bg: string; dot: string; text: string }> = {
+    ok: {
+      border: "border-emerald-400/30",
+      bg: "bg-emerald-500/[0.07]",
+      dot: "bg-emerald-400 shadow-[0_0_10px_#34d399]",
+      text: "text-emerald-200",
+    },
+    warn: {
+      border: "border-amber-400/40",
+      bg: "bg-amber-500/[0.08]",
+      dot: "bg-amber-400 shadow-[0_0_10px_#fbbf24] animate-pulse",
+      text: "text-amber-200",
+    },
+    bad: {
+      border: "border-red-400/40",
+      bg: "bg-red-500/[0.08]",
+      dot: "bg-red-400 shadow-[0_0_10px_#f87171] animate-pulse",
+      text: "text-red-200",
+    },
+  };
+  const s = styles[tone];
+
+  return (
+    <div className={`flex flex-wrap items-center gap-x-3 gap-y-1 rounded-2xl border ${s.border} ${s.bg} px-4 py-2.5`}>
+      <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${s.dot}`} aria-hidden />
+      <span className={`text-sm font-semibold ${s.text}`}>{title}</span>
+      {hint ? (
+        <code className="rounded bg-black/30 px-2 py-0.5 font-mono text-[11px] text-slate-300">
+          {hint}
+        </code>
+      ) : null}
+    </div>
+  );
+}
 
 /** Compact live feed - every REAL event as "<agent> <did> <what>". */
 function LiveFeed({ agents }: { agents: { agent_key: string; display_name_en: string; display_name_ar: string }[] }) {
@@ -97,14 +180,10 @@ export default function CommandCenterPage() {
     refetchInterval: 15_000,
   });
 
-  const createGoal = useMutation({
-    mutationFn: (title: string) => goalsApi.create({ title, description: title, source: "user" }),
-    onSuccess: () => {
-      toast.show(t("command_center.goal_created"), "success");
-      setGoalTitle("");
-      queryClient.invalidateQueries({ queryKey: ["goals"] });
-    },
-    onError: () => toast.show(t("common.error_generic"), "error"),
+  const workerQuery = useQuery({
+    queryKey: ["worker-status"],
+    queryFn: healthApi.worker,
+    refetchInterval: 8_000,
   });
 
   const requestPlan = useMutation({
@@ -120,6 +199,20 @@ export default function CommandCenterPage() {
         toast.show(t("common.error_generic"), "error");
       }
     },
+  });
+
+  // Sending a goal must actually START the company: create it AND immediately
+  // ask the CEO to plan (which fires the PLANNING core-state + the downstream
+  // plan/task cascade). One action, immediate reaction - no separate step.
+  const createGoal = useMutation({
+    mutationFn: (title: string) => goalsApi.create({ title, description: title, source: "user" }),
+    onSuccess: (goal) => {
+      toast.show(t("command_center.goal_created"), "success");
+      setGoalTitle("");
+      queryClient.invalidateQueries({ queryKey: ["goals"] });
+      if (goal?.id) requestPlan.mutate(goal.id);
+    },
+    onError: () => toast.show(t("common.error_generic"), "error"),
   });
 
   const emergencyStop = useMutation({
@@ -184,6 +277,11 @@ export default function CommandCenterPage() {
           </span>
         </div>
       </div>
+
+      {/* Company status banner - the honest answer to "is anything actually
+          going to happen when I send a command?". Reads the host worker's
+          heartbeat: running / asleep (not logged in) / down. */}
+      <WorkerBanner query={workerQuery} />
 
       {/* three-column neural layout */}
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[250px_minmax(0,1fr)_300px]">

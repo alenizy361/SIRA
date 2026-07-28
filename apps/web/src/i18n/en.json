@@ -96,7 +96,14 @@
     "connections": "Active Connections",
     "events_per_min": "Events (last min)",
     "live_feed": "Live Agent Feed",
-    "ask_placeholder": "Ask anything or give a command…"
+    "ask_placeholder": "Ask anything or give a command…",
+    "worker_running": "Company is running — agents are ready to respond",
+    "worker_running_lag": "Company running (last heartbeat {seconds}s ago)",
+    "worker_asleep": "Agents are asleep — the Claude session is not logged in",
+    "worker_asleep_hint": "On the server run: sudo -u aicompany -H claude auth login",
+    "worker_down": "The company worker is down — nothing will react",
+    "worker_down_hint": "On the server run: systemctl restart rabit-claude-worker.service",
+    "worker_checking": "Checking company status…"
   },
   "goals": {
     "title": "Goals",

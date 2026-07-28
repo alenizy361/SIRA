@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -69,6 +70,30 @@ def _task_to_contract(task: Task) -> TaskContract:
 AUTONOMOUS_EXECUTION_MODES = {"execute_low_risk", "controlled_autonomous"}
 
 
+def _write_worker_heartbeat(authed: bool) -> None:
+    """Publish a short-TTL liveness beacon to Redis so the API (and thus the
+    dashboard) can tell whether the company is actually running, and whether
+    the CLI is authenticated. Best-effort - never breaks the poll loop."""
+    try:
+        import json as _json
+
+        import redis as _redis
+
+        from app.config import get_settings
+
+        client = _redis.from_url(get_settings().redis_url, socket_timeout=3, socket_connect_timeout=3)
+        payload = _json.dumps({
+            "worker_id": WORKER_ID,
+            "authed": bool(authed),
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        # TTL a few ticks long: if the worker dies, the key expires and the API
+        # reports it down.
+        client.set("rabit:worker:heartbeat", payload, ex=int(POLL_INTERVAL_SECONDS * 4) + 10)
+    except Exception:  # noqa: BLE001
+        logger.debug("heartbeat write failed", exc_info=True)
+
+
 def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str, int]) -> int:
     """Runs a single poll tick across all organizations. Returns the number
     of tasks executed (0 on an idle tick - this is the common case)."""
@@ -90,6 +115,10 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
     except AuthenticationRequiredError:
         authed = False
         logger.warning("Claude CLI not authenticated - skipping CLI work this tick; queued work is preserved.")
+
+    # Beacon liveness + auth so the dashboard can show "company running" vs
+    # "asleep - run claude auth login".
+    _write_worker_heartbeat(authed)
 
     for org_id, autonomy_mode in db.query(Organization.id, Organization.autonomy_mode).all():
         if autonomy_mode not in AUTONOMOUS_EXECUTION_MODES:

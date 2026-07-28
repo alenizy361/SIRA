@@ -190,9 +190,18 @@ export const auditApi = {
   list: (limit = 100) => api.get<AuditLogEntry[]>(`/audit-logs?limit=${limit}`),
 };
 
+export interface WorkerStatus {
+  alive: boolean;
+  authed: boolean;
+  seconds_since_heartbeat?: number | null;
+  reason?: string;
+  hint?: string;
+}
+
 export const healthApi = {
   dependencies: () => api.get<HealthDependencies>("/health/dependencies"),
   live: () => api.get<{ status: string }>("/health/live"),
+  worker: () => api.get<WorkerStatus>("/health/worker"),
 };
 
 export const systemApi = {
