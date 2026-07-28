@@ -226,3 +226,39 @@ def test_permission_mode_maps_risk_to_safe_default():
     assert ClaudeCodeAdapter._permission_mode_for_risk("R2") == "acceptEdits"
     assert ClaudeCodeAdapter._permission_mode_for_risk("R3") == "plan"
     assert ClaudeCodeAdapter._permission_mode_for_risk("R4") == "plan"
+
+
+def test_allowed_tools_flag_is_never_omitted():
+    """Regression for "this command needs approval" hanging every run.
+
+    The worker is headless - nobody can answer an interactive permission
+    prompt. --allowedTools used to be skipped whenever a contract carried an
+    empty tool list (the CEO planning contract did exactly that), which left
+    the CLI on its default interactive policy: the first tool it reached for
+    became an approval request nothing could answer, so the run stalled until
+    it timed out. The allow-list must always be explicit.
+    """
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+    from claude_worker.task_contract import TaskContract
+
+    def contract(risk: str, tools: list[str]) -> TaskContract:
+        return TaskContract(
+            task_id="t1", mission="m", context="c", constraints=[],
+            allowed_tools=tools, prohibited_actions=[], acceptance_criteria=[],
+            output_schema=None, timeout_seconds=60, risk_level=risk,
+        )
+
+    # Empty list must still resolve to a real, non-empty allow-list.
+    for risk in ("R0", "R1", "R2", "R3"):
+        resolved = ClaudeCodeAdapter._effective_allowed_tools(contract(risk, []))
+        assert resolved, f"{risk} resolved to an empty allow-list"
+        assert "Read" in resolved
+
+    # An explicit contract list is always honored verbatim.
+    explicit = ClaudeCodeAdapter._effective_allowed_tools(contract("R1", ["Read", "Edit"]))
+    assert explicit == ["Read", "Edit"]
+
+    # Bash is never silently pre-authorized: arbitrary shell is the escalation
+    # that must go through the approvals flow, not a default.
+    for risk in ("R0", "R1", "R2", "R3"):
+        assert "Bash" not in ClaudeCodeAdapter._effective_allowed_tools(contract(risk, []))

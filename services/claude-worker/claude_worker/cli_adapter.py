@@ -233,6 +233,29 @@ class ClaudeCodeAdapter:
         # produces a plan without touching files.
         return "acceptEdits" if risk_level in ("R0", "R1", "R2") else "plan"
 
+    # Read-only tools: safe for any tier, and enough for a reasoning-only run
+    # (the CEO's planning call) to inspect context without ever needing a
+    # human decision.
+    READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
+    # Adds file authoring for tiers permitted to change code. Bash is
+    # deliberately EXCLUDED: arbitrary shell is the escalation that genuinely
+    # warrants a human approval, so a task needing it must come through the
+    # approvals flow rather than being silently pre-authorized here.
+    EDIT_TOOLS = ("Read", "Grep", "Glob", "Write", "Edit")
+
+    @classmethod
+    def _effective_allowed_tools(cls, task: TaskContract) -> list[str]:
+        """The explicit tool allow-list handed to the CLI.
+
+        Falls back to a safe default when the contract names none, so the
+        headless run is never left on the CLI's interactive default policy.
+        """
+        if task.allowed_tools:
+            return list(task.allowed_tools)
+        if task.risk_level in ("R0", "R1", "R2"):
+            return list(cls.EDIT_TOOLS)
+        return list(cls.READ_ONLY_TOOLS)
+
     # -- run ------------------------------------------------------------
 
     def start_run(
@@ -271,8 +294,16 @@ class ClaudeCodeAdapter:
 
         if capabilities.supports_permission_mode:
             args += ["--permission-mode", self._permission_mode_for_risk(task.risk_level)]
-        if capabilities.supports_allowed_tools and task.allowed_tools:
-            args += ["--allowedTools", ",".join(task.allowed_tools)]
+        # ALWAYS pass an explicit allow-list. Omitting it (which used to happen
+        # whenever task.allowed_tools was empty - e.g. the CEO planning
+        # contract) leaves the CLI on its default interactive policy, so the
+        # first tool it wants surfaces as "this command needs approval" and the
+        # run stalls until it times out. Nothing can answer that prompt: the
+        # worker is headless. An explicit list keeps every decision
+        # pre-authorized, and anything outside it is refused rather than
+        # blocking on a human who will never see the question.
+        if capabilities.supports_allowed_tools:
+            args += ["--allowedTools", ",".join(self._effective_allowed_tools(task))]
         if task.output_schema and capabilities.supports_json_schema:
             args += ["--json-schema", json.dumps(task.output_schema)]
         if task.model:

@@ -77,7 +77,12 @@ def _build_ceo_task_contract(goal: Goal, valid_agent_keys: set[str]) -> TaskCont
             "Every task's risk_level must be R0, R1, or R2.",
             "Produce between 2 and 5 tasks.",
         ],
-        allowed_tools=[],
+        # Read-only: planning is pure reasoning, but the list must be explicit.
+        # An empty list used to mean "send no --allowedTools flag", which left
+        # the CLI on its interactive default and made the very first tool it
+        # reached for surface as "this command needs approval" - unanswerable
+        # in a headless worker, so planning just hung until it timed out.
+        allowed_tools=["Read", "Grep", "Glob"],
         prohibited_actions=["deploy_production", "spend_money", "modify_permissions"],
         acceptance_criteria=["Valid JSON matching the required output schema"],
         output_schema=PLAN_OUTPUT_SCHEMA,
@@ -174,7 +179,7 @@ def plan_goal(db, goal: Goal) -> Plan:
             risk_level=item["risk_level"],
             state="ready",
             idempotency_key=f"{goal.id}-plan-{plan.id}-{i}",
-            acceptance_criteria={"criteria": [], "allowed_tools": ["Read", "Edit"]},
+            acceptance_criteria={"criteria": [], "allowed_tools": ["Read", "Grep", "Glob", "Write", "Edit"]},
         )
         db.add(task_row)
         created_tasks.append(task_row)

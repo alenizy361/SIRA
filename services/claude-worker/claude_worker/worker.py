@@ -51,7 +51,7 @@ def _task_to_contract(task: Task) -> TaskContract:
         mission=task.description,
         context=f"Task title: {task.title}",
         constraints=ac.get("constraints", []),
-        allowed_tools=ac.get("allowed_tools", ["Read", "Edit"]),
+        allowed_tools=ac.get("allowed_tools", ["Read", "Grep", "Glob", "Write", "Edit"]),
         prohibited_actions=ac.get("prohibited_actions", []),
         acceptance_criteria=ac.get("criteria", []),
         output_schema=None,
