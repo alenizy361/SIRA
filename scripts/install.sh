@@ -664,10 +664,20 @@ configure_nginx() {
   local template="$APP_ROOT/infra/nginx/rabit-os.conf.template"
   [[ -f "$template" ]] || { log_warn "Template ${template} not found — skipping nginx configuration."; return; }
 
+  # Extra CSP connect-src sources, ONLY when a real domain is configured. With
+  # no domain, `domain` is nginx's catch-all "_" and interpolating it produced
+  # the invalid sources `wss://_ https://_`, which browsers reject outright
+  # ("contains an invalid source ... It will be ignored"), leaving a
+  # permanently malformed security header on every response.
+  local csp_extra=""
+  if [[ "$domain" != "_" ]]; then
+    csp_extra=" wss://${domain} https://${domain}"
+  fi
+
   log_step "Configuring Nginx (DOMAIN=${domain}, WEB_PORT=${web_port}, API_PORT=${api_port})"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-  DOMAIN="$domain" WEB_PORT="$web_port" API_PORT="$api_port" \
-    envsubst '${DOMAIN} ${WEB_PORT} ${API_PORT}' < "$template" > /etc/nginx/sites-available/rabit-os.conf
+  DOMAIN="$domain" WEB_PORT="$web_port" API_PORT="$api_port" CSP_CONNECT_EXTRA="$csp_extra" \
+    envsubst '${DOMAIN} ${WEB_PORT} ${API_PORT} ${CSP_CONNECT_EXTRA}' < "$template" > /etc/nginx/sites-available/rabit-os.conf
 
   if [[ "$domain" == "_" ]]; then
     # No real domain configured: this server block is meant to catch bare-IP

@@ -79,7 +79,14 @@ server {
     # over same-origin /api/ and /ws. Tighten further once real asset/CDN
     # origins are finalized; loosen 'unsafe-inline'/'unsafe-eval' only if a
     # build actually requires it (Next.js dev mode does; prod usually doesn't).
-    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss://${DOMAIN} https://${DOMAIN}; frame-src 'none'" always;
+    # connect-src: ${CSP_CONNECT_EXTRA} is "wss://<domain> https://<domain>" when a
+    # real DOMAIN is configured, and EMPTY on a bare-IP install. It must not be
+    # built from ${DOMAIN} directly: with no domain set, DOMAIN is nginx's
+    # catch-all "_", which rendered the literal sources `wss://_ https://_` -
+    # invalid URLs that every browser rejects with "contains an invalid source:
+    # 'wss://_'. It will be ignored." Same-origin sockets keep working there
+    # because 'self' covers them, but the header was permanently malformed.
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'${CSP_CONNECT_EXTRA}; frame-src 'none'" always;
 
     # HSTS — leave commented out until a valid TLS certificate is confirmed
     # working end-to-end (enabling this on plain HTTP will not add security
