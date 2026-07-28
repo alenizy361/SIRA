@@ -339,10 +339,23 @@ generate_env() {
 # ---------------------------------------------------------------------------
 # 8. docker compose services + migrations
 # ---------------------------------------------------------------------------
+build_app_images() {
+  [[ -f "$COMPOSE_FILE" ]] || die "docker-compose.yml not found at ${COMPOSE_FILE}."
+  # `docker compose up` (used by rabit-api.service/rabit-web.service, and
+  # by run_migrations below) does NOT rebuild an already-existing local
+  # image just because its Dockerfile changed on disk - re-running this
+  # script after a code update (e.g. `git pull` into the source checkout,
+  # which sync_repo_to_app_root then rsyncs into APP_ROOT) would silently
+  # keep serving the OLD image otherwise. Found for real: a fix to
+  # api.Dockerfile had no effect until this explicit build step existed.
+  log_step "Building api/web images (picks up any Dockerfile/source changes)"
+  compose build api web
+}
+
 start_data_services() {
   [[ -f "$COMPOSE_FILE" ]] || die "docker-compose.yml not found at ${COMPOSE_FILE}."
   log_step "Pulling images and starting postgres + redis"
-  compose pull
+  compose pull postgres redis
   compose up -d postgres redis
   log_info "Waiting for postgres to become healthy..."
   wait_for_container_healthy postgres 120 || die "postgres did not become healthy in time. Check: (cd ${APP_ROOT} && ${COMPOSE_CMD[*]:-docker compose} logs postgres)"
@@ -475,6 +488,7 @@ main() {
   load_env_file "$APP_ROOT/.env"
   sync_env_defaults
   start_data_services
+  build_app_images
   run_migrations
   install_systemd_units
   start_app_services
