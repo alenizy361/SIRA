@@ -4,13 +4,37 @@ All secrets come from environment variables (see .env.example at repo root).
 Nothing here is a real credential - CHANGE_ME placeholders are rejected by
 scripts/install.sh which generates real values with `openssl rand`.
 """
+import os
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _readable_env_file() -> str | None:
+    """Point pydantic at the repo-root .env ONLY when this process can read it.
+
+    The host claude-worker runs as the non-root `aicompany` user, while .env is
+    intentionally locked to root (it holds the DB/session secrets). systemd's
+    `EnvironmentFile=` already injects those values into the worker's
+    environment, so the file itself is redundant there - but pydantic-settings
+    would still try to OPEN it and crash the entire process with
+    `PermissionError: [Errno 13] Permission denied: '.env'` (the real cause of
+    the worker's status=1/FAILURE crash-loop). Only hand pydantic the path when
+    the file is present AND readable; otherwise fall back to the real
+    environment, which already carries every value it needs.
+    """
+    path = Path(".env")
+    try:
+        if path.is_file() and os.access(path, os.R_OK):
+            return str(path)
+    except OSError:
+        pass
+    return None
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_readable_env_file(), extra="ignore")
 
     environment: str = "development"
     organization_default_currency: str = "SAR"

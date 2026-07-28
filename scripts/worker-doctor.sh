@@ -67,13 +67,33 @@ fi
 # psql does not understand SQLAlchemy's +psycopg dialect marker.
 PSQL_URL="${DB_URL/postgresql+psycopg:\/\//postgresql:\/\/}"
 
-if [[ -z "$PSQL_URL" ]]; then
+# Probe Postgres AUTHORITATIVELY - connect exactly the way the worker does,
+# via its own venv's psycopg. Using `psql` alone gives a false "NOT reachable"
+# on a host that simply doesn't have the postgresql-client package installed
+# (a very common case: redis-cli is present but psql is not), which sends
+# operators chasing a database problem that does not exist.
+VENV_PY="$APP_ROOT/.venv/bin/python"
+if [[ -z "$DB_URL" ]]; then
   bad "Could not read DATABASE_URL from ${APP_ROOT}/.env"
   PROBLEMS=$((PROBLEMS+1))
-elif psql "$PSQL_URL" -tAc 'SELECT 1' >/dev/null 2>&1; then
-  ok "Postgres reachable from the host"
+elif [[ -x "$VENV_PY" ]] && "$VENV_PY" - "$DB_URL" <<'PY' >/dev/null 2>&1
+import sys
+import psycopg
+url = sys.argv[1].replace("postgresql+psycopg://", "postgresql://")
+with psycopg.connect(url, connect_timeout=5) as conn:
+    conn.execute("SELECT 1")
+PY
+then
+  ok "Postgres reachable from the host (via the worker's own psycopg)"
+elif command -v psql >/dev/null 2>&1 && psql "$PSQL_URL" -tAc 'SELECT 1' >/dev/null 2>&1; then
+  ok "Postgres reachable from the host (via psql)"
+elif [[ ! -x "$VENV_PY" ]] && ! command -v psql >/dev/null 2>&1; then
+  warn "Cannot verify Postgres: neither the worker venv nor psql is available here."
+  warn "The worker itself will still connect - check its heartbeat after it restarts."
 else
   bad "Postgres NOT reachable from the host (the worker cannot work without it)"
+  echo "     URL host/port from .env: ${DB_URL#*@}"
+  echo "     Is the compose stack up?  docker compose -f ${APP_ROOT}/docker-compose.yml ps"
   PROBLEMS=$((PROBLEMS+1))
 fi
 if redis-cli -h 127.0.0.1 ping 2>/dev/null | grep -q PONG; then
