@@ -153,3 +153,58 @@ def test_every_sys_path_parent_computation_resolves_to_a_real_directory():
                 bad.append(f"{py.relative_to(REPO_ROOT)}: parents[{depth}]"
                            f"{'/' + suffix if suffix else ''} -> {resolved} (does not exist)")
     assert not bad, "sys.path bootstrap paths that do not resolve:\n" + "\n".join(bad)
+
+def _run_repair_env(tmp_path, env_text: str) -> str:
+    """Executes install.sh's real repair_env_urls() against a throwaway .env."""
+    import subprocess
+
+    (tmp_path / ".env").write_text(env_text)
+    script = f'''
+set -u
+APP_ROOT="{tmp_path}"
+AICOMPANY_USER="$(id -un)"
+log_warn(){{ :; }}; log_ok(){{ :; }}
+eval "$(sed -n '/^repair_env_urls() {{/,/^}}/p' "{REPO_ROOT}/scripts/install.sh")"
+repair_env_urls
+'''
+    subprocess.run(["bash", "-c", script], check=True, capture_output=True)
+    return (tmp_path / ".env").read_text()
+
+
+def test_installer_repairs_a_corrupt_database_url(tmp_path):
+    """Regression for the worker crash-loop
+    `ArgumentError: Could not parse SQLAlchemy URL from string '<hex>'`.
+
+    An older installer replaced the CHANGE_ME token wholesale, turning
+    DATABASE_URL into a bare secret. generate_env never overwrites an existing
+    .env, so that damage survived every re-install and the worker could never
+    connect. repair_env_urls must rebuild the URL from the sibling POSTGRES_*
+    values (which match the live container by construction)."""
+    from sqlalchemy.engine.url import make_url
+
+    out = _run_repair_env(
+        tmp_path,
+        "POSTGRES_USER=rabit\n"
+        "POSTGRES_PASSWORD=deadbeefcafe\n"
+        "POSTGRES_DB=rabit_os\n"
+        "DATABASE_URL=ba4068687a63926d2684a98f67c7d6d63d56d9bf4b7b1753b283af0a576fb81a\n"
+        "REDIS_URL=redis://localhost:6379/0\n",
+    )
+    url = next(l.split("=", 1)[1].strip() for l in out.splitlines() if l.startswith("DATABASE_URL="))
+    parsed = make_url(url)  # must not raise
+    assert parsed.drivername == "postgresql+psycopg"
+    assert parsed.host == "localhost" and parsed.database == "rabit_os"
+    # Must reuse the password the Postgres container was initialized with.
+    assert parsed.password == "deadbeefcafe"
+
+
+def test_installer_never_rewrites_a_valid_env(tmp_path):
+    """A valid (possibly hand-customized) .env must be left byte-for-byte
+    alone - repair only ever touches a value that is not a URL."""
+    original = (
+        "POSTGRES_USER=rabit\n"
+        "POSTGRES_PASSWORD=pw\n"
+        "DATABASE_URL=postgresql+psycopg://custom:pw@db.internal:6543/other\n"
+        "REDIS_URL=redis://cache.internal:6379/3\n"
+    )
+    assert _run_repair_env(tmp_path, original) == original

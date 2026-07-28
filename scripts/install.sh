@@ -488,6 +488,75 @@ generate_env() {
 }
 
 # ---------------------------------------------------------------------------
+# 7b. Repair a STRUCTURALLY BROKEN .env left behind by an older installer.
+#
+# generate_env refuses to overwrite an existing .env (never clobber secrets) -
+# correct, but it means a .env written by a previous, buggy version of this
+# script stays broken forever. The specific damage that shipped: CHANGE_ME was
+# replaced WHOLESALE instead of in place, so
+#   DATABASE_URL=postgresql+psycopg://rabit:CHANGE_ME@localhost:5432/rabit_os
+# became a bare hex string. SQLAlchemy then dies with
+#   ArgumentError: Could not parse SQLAlchemy URL from string '<hex>'
+# and the worker crash-loops forever while the dashboard shows nothing.
+#
+# Repair is safe and lossless: every component needed to rebuild the URL is
+# already in the same file (POSTGRES_USER/PASSWORD/DB/PORT), and the Postgres
+# container was initialized from POSTGRES_PASSWORD, so the rebuilt URL matches
+# the live database by construction. Only a value that is not a URL is touched;
+# a valid custom URL is always left alone, and .env is backed up first.
+# ---------------------------------------------------------------------------
+repair_env_urls() {
+  local target="$APP_ROOT/.env"
+  [[ -f "$target" ]] || return 0
+
+  local _get
+  _get() { sed -n "s/^${1}=//p" "$target" | head -1; }
+
+  local db_url redis_url repaired=0
+  db_url="$(_get DATABASE_URL)"
+  redis_url="$(_get REDIS_URL)"
+
+  # A usable SQLAlchemy/Redis URL must contain a scheme separator.
+  local need_db=0 need_redis=0
+  [[ "$db_url" != *"://"* ]] && need_db=1
+  [[ "$redis_url" != *"://"* ]] && need_redis=1
+  [[ "$need_db" -eq 0 && "$need_redis" -eq 0 ]] && return 0
+
+  cp -a "$target" "${target}.broken.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+  if [[ "$need_db" -eq 1 ]]; then
+    local pg_user pg_pw pg_db pg_port
+    pg_user="$(_get POSTGRES_USER)"; pg_user="${pg_user:-rabit}"
+    pg_pw="$(_get POSTGRES_PASSWORD)"
+    pg_db="$(_get POSTGRES_DB)";     pg_db="${pg_db:-rabit_os}"
+    pg_port="$(_get POSTGRES_PORT)"; pg_port="${pg_port:-5432}"
+    if [[ -z "$pg_pw" ]]; then
+      log_warn "DATABASE_URL in ${target} is not a URL and POSTGRES_PASSWORD is missing — cannot repair automatically. Fix DATABASE_URL by hand."
+    else
+      local new_url="postgresql+psycopg://${pg_user}:${pg_pw}@localhost:${pg_port}/${pg_db}"
+      # Use a non-/ delimiter: the URL contains slashes.
+      sed -i "s|^DATABASE_URL=.*|DATABASE_URL=${new_url}|" "$target"
+      log_warn "Repaired a corrupt DATABASE_URL in ${target} (it was a bare secret, not a URL — the worker could never connect)."
+      repaired=1
+    fi
+  fi
+
+  if [[ "$need_redis" -eq 1 ]]; then
+    local rd_port
+    rd_port="$(_get REDIS_PORT)"; rd_port="${rd_port:-6379}"
+    sed -i "s|^REDIS_URL=.*|REDIS_URL=redis://localhost:${rd_port}/0|" "$target"
+    log_warn "Repaired a corrupt REDIS_URL in ${target}."
+    repaired=1
+  fi
+
+  if [[ "$repaired" -eq 1 ]]; then
+    chmod 600 "$target"
+    chown "root:${AICOMPANY_USER}" "$target" 2>/dev/null || true
+    log_ok "A backup of the previous .env was kept alongside it (*.broken.*)."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # 8. docker compose services + migrations
 # ---------------------------------------------------------------------------
 build_app_images() {
@@ -670,6 +739,10 @@ main() {
   setup_worker_venv
   verify_claude_cli
   generate_env
+  # Heal a .env written by an older, buggy installer BEFORE anything reads it
+  # (generate_env deliberately never overwrites an existing file, so a corrupt
+  # DATABASE_URL would otherwise survive every re-install).
+  repair_env_urls
   # .env may define POSTGRES_*/DB_NAME overrides — load it so downstream
   # steps (compose, migrations) see the same values docker compose will.
   load_env_file "$APP_ROOT/.env"
