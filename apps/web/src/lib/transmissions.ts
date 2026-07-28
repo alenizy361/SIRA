@@ -51,6 +51,8 @@ export function toTransmission(e: WireEvent): Transmission {
       return { tone: "warning", verbEn: "is blocked", verbAr: "توقف", detail: str(p.reason) };
     case "task.completed":
       return { tone: "success", verbEn: "completed a task", verbAr: "أكمل مهمة", detail: str(p.title) };
+    case "goal.completed":
+      return { tone: "success", verbEn: "finished the goal", verbAr: "أنجز الهدف بالكامل", detail: str(p.title) };
     case "run.tool.started":
       return {
         tone: "active",

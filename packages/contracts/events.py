@@ -18,6 +18,7 @@ class EventType(str, Enum):
     SYSTEM_STATUS_CHANGED = "system.status.changed"
     AGENT_STATUS_CHANGED = "agent.status.changed"
     GOAL_CREATED = "goal.created"
+    GOAL_COMPLETED = "goal.completed"
     PLAN_CREATED = "plan.created"
     TASK_CREATED = "task.created"
     TASK_ASSIGNED = "task.assigned"

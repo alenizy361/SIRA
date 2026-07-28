@@ -33,7 +33,7 @@ from contracts.events import CoreState, EntityRef, EventType  # noqa: E402
 from orchestrator.leasing import LeaseNotAcquired, acquire_lease, expire_stale_leases, release_lease  # noqa: E402
 from orchestrator.progression import advance_ready_pipeline  # noqa: E402
 from orchestrator.scheduler import pick_ready_tasks  # noqa: E402
-from orchestrator.state_machine import InvalidTransition, TaskState, transition_task  # noqa: E402
+from orchestrator.state_machine import GoalState, InvalidTransition, TaskState, transition_goal, transition_task  # noqa: E402
 
 from .cli_adapter import AuthenticationRequiredError, ClaudeCodeAdapter
 from .task_contract import TaskContract
@@ -59,6 +59,71 @@ def _task_to_contract(task: Task) -> TaskContract:
         risk_level=task.risk_level,
         workspace_repo=task.workspace_repo,
     )
+
+
+# The linear happy-path GoalState order (skipping the optional
+# APPROVAL_PENDING/PREVIEW_READY branches, which nothing in this codebase ever
+# enters) - used to walk a goal forward from wherever it currently sits once
+# every one of its tasks has finished.
+_GOAL_HAPPY_PATH = [
+    GoalState.PLAN_DRAFTED, GoalState.PLAN_REVIEWED, GoalState.RISK_CLASSIFIED,
+    GoalState.READY, GoalState.ASSIGNED, GoalState.RUNNING, GoalState.VALIDATING,
+    GoalState.REVIEWING, GoalState.MEASURING, GoalState.COMPLETED,
+]
+
+
+def _advance_completed_goals(db, org_id) -> int:
+    """Advances a goal to COMPLETED once every task under its plan has reached
+    a terminal state (completed/cancelled).
+
+    Goal.state was previously written in exactly two places: planning.py
+    (which stops at PLAN_DRAFTED) and the manual /goals/{id}/transition
+    endpoint. Nothing ever advanced it further - so a goal whose CEO plan had
+    already 100% completed (every task done) sat showing "plan_drafted"
+    forever. The dashboard, and the operator, had no way to tell a genuinely
+    finished goal apart from one that had barely started. This is DB-only
+    (no CLI call), so it runs every tick regardless of Claude auth state, same
+    as advance_ready_pipeline.
+    """
+    from app.models.company import Goal
+    from app.models.work import Plan, Task
+    from contracts.events import EntityRef, EventType
+
+    _TERMINAL_OK = {TaskState.COMPLETED.value, TaskState.CANCELLED.value}
+    _IN_FLIGHT = [s.value for s in _GOAL_HAPPY_PATH[:-1]]  # everything but COMPLETED itself
+
+    goals = (
+        db.query(Goal)
+        .filter(Goal.organization_id == org_id, Goal.state.in_(_IN_FLIGHT))
+        .all()
+    )
+    advanced = 0
+    for goal in goals:
+        try:
+            current = GoalState(goal.state)
+            idx = _GOAL_HAPPY_PATH.index(current)
+        except ValueError:
+            continue  # goal is in a branch state (approval_pending/preview_ready) - not handled here
+
+        plan_ids = [row[0] for row in db.query(Plan.id).filter(Plan.goal_id == goal.id).all()]
+        if not plan_ids:
+            continue
+        task_states = [row[0] for row in db.query(Task.state).filter(Task.plan_id.in_(plan_ids)).all()]
+        if not task_states or not all(s in _TERMINAL_OK for s in task_states):
+            continue  # still has work in flight, or nothing was ever created
+
+        state = current
+        for target in _GOAL_HAPPY_PATH[idx + 1:]:
+            state = transition_goal(state, target)
+        goal.state = state.value
+        db.add(goal)
+        db.commit()
+        publish(
+            org_id, EventType.GOAL_COMPLETED, "ceo", str(goal.id),
+            payload={"title": goal.title}, entities=[EntityRef(type="goal", id=str(goal.id))],
+        )
+        advanced += 1
+    return advanced
 
 
 # Autonomy modes that permit the poll loop to pick up new work. Emergency
@@ -126,6 +191,9 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
         # DB-only progression always runs (no CLI): requeue orphaned tasks from
         # a dead worker, run retry backoff, cancel dead-dependency branches.
         advance_ready_pipeline(db, org_id)
+        # Also DB-only: a goal whose every task has finished must actually
+        # reach COMPLETED, not sit at plan_drafted forever.
+        _advance_completed_goals(db, org_id)
         if not authed:
             continue
         # 1. Goals whose owner asked the CEO agent to plan them (needs the

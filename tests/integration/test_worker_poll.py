@@ -224,3 +224,94 @@ def test_pending_plan_failure_marks_goal_failed(db, org_id, monkeypatch):
     db.refresh(goal)
     assert goal.metadata_json.get("plan_status") == "failed"
     assert "plan_error" in goal.metadata_json
+
+
+def test_goal_advances_to_completed_once_all_its_tasks_finish(db, org_id):
+    """Regression: Goal.state was only ever written by planning.py (stops at
+    plan_drafted) and the manual /transition endpoint - nothing ever advanced
+    it further, so a goal whose plan had 100% completed tasks sat showing
+    'plan_drafted' forever. The operator (and the dashboard) had no way to
+    tell a finished goal apart from a barely-started one."""
+    import json
+
+    from app.config import get_settings
+    from app.models.company import Goal
+    from app.models.work import Plan, Task
+    from app.realtime.bus import EventBus
+    from claude_worker.worker import _advance_completed_goals
+
+    goal = Goal(
+        organization_id=org_id,
+        title="Ship the landing page",
+        description="A fast Arabic landing page.",
+        state="plan_drafted",
+    )
+    db.add(goal)
+    db.flush()
+    plan = Plan(organization_id=org_id, goal_id=goal.id, title="Landing page delivery", state="drafted")
+    db.add(plan)
+    db.flush()
+    t1 = Task(
+        organization_id=org_id, plan_id=plan.id, title="Build hero", description="d",
+        assigned_agent_key="frontend_engineer", risk_level="R1", state="completed",
+        idempotency_key=f"t1-{uuid.uuid4()}", acceptance_criteria={},
+    )
+    t2 = Task(
+        organization_id=org_id, plan_id=plan.id, title="QA pass", description="d",
+        assigned_agent_key="qa", risk_level="R0", state="cancelled",
+        idempotency_key=f"t2-{uuid.uuid4()}", acceptance_criteria={},
+    )
+    db.add_all([t1, t2])
+    db.commit()
+
+    bus = EventBus(get_settings().redis_url)
+    pubsub = bus.pubsub(str(org_id))
+    pubsub.get_message(timeout=0.1)
+
+    advanced = _advance_completed_goals(db, org_id)
+    assert advanced == 1
+
+    db.refresh(goal)
+    assert goal.state == "completed"
+
+    msg = pubsub.get_message(timeout=1.0)
+    while msg and msg.get("type") != "message":
+        msg = pubsub.get_message(timeout=1.0)
+    pubsub.close()
+    assert msg is not None
+    payload = json.loads(msg["data"])
+    assert payload["type"] == "goal.completed"
+    assert payload["entities"][0]["id"] == str(goal.id)
+
+
+def test_goal_stays_put_while_any_task_is_still_in_flight(db, org_id):
+    """A single non-terminal task must block auto-completion - otherwise a
+    goal could be falsely marked done while real work is still running."""
+    from app.models.company import Goal
+    from app.models.work import Plan, Task
+    from claude_worker.worker import _advance_completed_goals
+
+    goal = Goal(
+        organization_id=org_id, title="Multi-step goal", description="d", state="plan_drafted",
+    )
+    db.add(goal)
+    db.flush()
+    plan = Plan(organization_id=org_id, goal_id=goal.id, title="Plan", state="drafted")
+    db.add(plan)
+    db.flush()
+    db.add(Task(
+        organization_id=org_id, plan_id=plan.id, title="Done part", description="d",
+        assigned_agent_key="qa", risk_level="R0", state="completed",
+        idempotency_key=f"t1-{uuid.uuid4()}", acceptance_criteria={},
+    ))
+    db.add(Task(
+        organization_id=org_id, plan_id=plan.id, title="Still running", description="d",
+        assigned_agent_key="qa", risk_level="R0", state="running",
+        idempotency_key=f"t2-{uuid.uuid4()}", acceptance_criteria={},
+    ))
+    db.commit()
+
+    advanced = _advance_completed_goals(db, org_id)
+    assert advanced == 0
+    db.refresh(goal)
+    assert goal.state == "plan_drafted"
