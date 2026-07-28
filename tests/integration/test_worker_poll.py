@@ -704,3 +704,134 @@ def test_task_with_no_prior_session_is_skipped_for_reply(db, org_id, monkeypatch
 
     executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
     assert executed == 0
+
+
+def test_chat_turn_is_no_tools_haiku_and_resumes_the_orgs_session(db, org_id, monkeypatch):
+    """The separate casual-chat surface: a pending human ChatMessage must be
+    answered using no_tools=True and CHAT_MODEL (never the task pipeline's
+    defaults), and a follow-up message must resume the org's existing
+    ChatSession.cli_session_id - never a new Goal/Plan/Task."""
+    from app.models.chat import ChatMessage, ChatSession
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+    from claude_worker.worker import CHAT_MODEL
+
+    session = ChatSession(organization_id=org_id, cli_session_id="chat-sess-prior", created_at=datetime.now(timezone.utc))
+    db.add(session)
+    db.flush()
+    db.add(ChatMessage(
+        organization_id=org_id, chat_session_id=session.id, role="human", body="what's 2+2?",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    captured = {}
+
+    def _fake_chat_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
+        captured["resume_session_id"] = resume_session_id
+        captured["no_tools"] = contract.no_tools
+        captured["model"] = contract.model
+        captured["mission"] = contract.mission
+
+        class _Handle:
+            cancelled = False
+
+            def cancel(self):
+                pass
+
+        def _wait():
+            return _FakeRunResult(
+                task_id=contract.task_id, run_id=run_id, exit_code=0, timed_out=False,
+                cancelled=False, cost_usd=None, cli_session_id="chat-sess-prior", workspace_path=None,
+                branch_name=None, baseline_commit=None, final_commit=None,
+                result_summary="4.", changed_files=[],
+            )
+
+        return _Handle(), _wait
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_chat_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    executed = run_once(db, adapter, agent_concurrency_limits={})
+    assert executed == 1
+
+    assert captured["resume_session_id"] == "chat-sess-prior"
+    assert captured["no_tools"] is True
+    assert captured["model"] == CHAT_MODEL
+    assert captured["mission"] == "what's 2+2?"
+
+    db.refresh(session)
+    assert session.claimed_at is None  # released after the turn finished
+    assert session.cli_session_id == "chat-sess-prior"
+
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.chat_session_id == session.id)
+        .order_by(ChatMessage.created_at)
+        .all()
+    )
+    assert [m.role for m in messages] == ["human", "agent"]
+    assert messages[1].body == "4."
+
+
+def test_chat_turn_is_skipped_while_already_claimed_within_ttl(db, org_id, monkeypatch):
+    """A session claimed moments ago by another (still-running) tick must not
+    be double-processed."""
+    from app.models.chat import ChatMessage, ChatSession
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    session = ChatSession(
+        organization_id=org_id, created_at=datetime.now(timezone.utc),
+        claimed_at=datetime.now(timezone.utc), claimed_by="some-other-worker",
+    )
+    db.add(session)
+    db.flush()
+    db.add(ChatMessage(
+        organization_id=org_id, chat_session_id=session.id, role="human", body="hello?",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
+        raise AssertionError("must not process a chat turn while its session is already claimed")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    executed = run_once(db, adapter, agent_concurrency_limits={})
+    assert executed == 0
+
+
+def test_chat_turn_reclaims_a_stale_claim_past_the_ttl(db, org_id, monkeypatch):
+    """A worker that crashed mid-turn leaves its claim stranded - once
+    CHAT_CLAIM_TTL_SECONDS has passed, a later tick must be able to reclaim
+    and process the session rather than leaving it stuck forever."""
+    from datetime import timedelta
+
+    from app.models.chat import ChatMessage, ChatSession
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+    from claude_worker.worker import CHAT_CLAIM_TTL_SECONDS
+
+    stale_claim = datetime.now(timezone.utc) - timedelta(seconds=CHAT_CLAIM_TTL_SECONDS + 30)
+    session = ChatSession(
+        organization_id=org_id, created_at=datetime.now(timezone.utc),
+        claimed_at=stale_claim, claimed_by="dead-worker",
+    )
+    db.add(session)
+    db.flush()
+    db.add(ChatMessage(
+        organization_id=org_id, chat_session_id=session.id, role="human", body="still there?",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    executed = run_once(db, adapter, agent_concurrency_limits={})
+    assert executed == 1
+
+    db.refresh(session)
+    assert session.claimed_at is None

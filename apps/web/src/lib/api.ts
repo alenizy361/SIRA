@@ -298,6 +298,25 @@ export const runsApi = {
   list: () => api.get<unknown[]>("/runs"),
 };
 
+export interface ChatMessage {
+  id: string;
+  chat_session_id: string;
+  role: "human" | "agent";
+  body: string;
+  created_at: string;
+}
+
+// The separate, always-available casual-chat surface - genuinely independent
+// of the Goal -> Plan -> Task pipeline (no goal/plan/task is ever created
+// here). One persistent thread per org; claude_worker.worker's
+// _execute_chat_turn answers with no_tools=True and a fast/cheap model.
+// Unlike tasksApi.sendMessage, there is no 409 precondition - a first
+// message always succeeds.
+export const chatApi = {
+  listMessages: () => api.get<ChatMessage[]>("/chat/messages"),
+  sendMessage: (content: string) => api.post<ChatMessage>("/chat/messages", { content }),
+};
+
 export const memoryApi = {
   list: () => api.get<unknown[]>("/memory"),
 };

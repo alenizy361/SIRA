@@ -560,3 +560,49 @@ def test_message_endpoint_accepts_and_lists_a_real_conversation_thread(client):
 
     resp = client.post(f"/tasks/{task_id}/messages", json={"content": ""})
     assert resp.status_code == 422, "an empty message body must be rejected"
+
+
+def test_chat_endpoint_accepts_a_first_message_with_no_precondition(client):
+    """Unlike /tasks/{id}/messages, casual chat has no "no completed run
+    yet" 409 - a brand-new org's very first message must always succeed,
+    since chat_views._get_or_create_session makes the ChatSession right
+    there rather than requiring one to already exist."""
+    from app.db import get_sessionmaker
+    from app.models.chat import ChatMessage, ChatSession
+    from app.models.identity import Organization
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    # Clean slate so this test is independent of chat state left by other tests.
+    db.query(ChatMessage).filter(ChatMessage.organization_id == org_id).delete()
+    db.query(ChatSession).filter(ChatSession.organization_id == org_id).delete()
+    db.commit()
+    db.close()
+
+    resp = client.post("/chat/messages", json={"content": "hi there"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["role"] == "human"
+    assert body["body"] == "hi there"
+
+    resp = client.get("/chat/messages")
+    assert resp.status_code == 200, resp.text
+    messages = resp.json()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "human"
+    assert messages[0]["body"] == "hi there"
+
+    # A second message lands in the SAME session (one persistent thread per org).
+    resp = client.post("/chat/messages", json={"content": "how are you?"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["chat_session_id"] == messages[0]["chat_session_id"]
+
+    resp = client.get("/chat/messages")
+    assert [m["body"] for m in resp.json()] == ["hi there", "how are you?"]
+
+    resp = client.post("/chat/messages", json={"content": ""})
+    assert resp.status_code == 422, "an empty chat message must be rejected"

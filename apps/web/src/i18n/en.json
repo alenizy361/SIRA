@@ -232,5 +232,17 @@
     "warning": "Warning",
     "incident": "Incident",
     "paused": "Paused"
+  },
+  "chat": {
+    "launcher": "Chat",
+    "title": "Just chat",
+    "subtitle": "Casual conversation - separate from your goals. Nothing here creates a goal, plan, or task.",
+    "placeholder": "Say something…",
+    "send": "Send",
+    "sending": "Sending…",
+    "empty": "Say hi - this is just a normal conversation, not a work request.",
+    "you": "You",
+    "failed": "Could not send that message",
+    "close": "Close chat"
   }
 }

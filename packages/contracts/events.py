@@ -28,6 +28,7 @@ class EventType(str, Enum):
     TASK_COMPLETED = "task.completed"
     TASK_CANCELLED = "task.cancelled"
     TASK_MESSAGE = "task.message"
+    CHAT_MESSAGE = "chat.message"
     RUN_OUTPUT_DELTA = "run.output.delta"
     RUN_TOOL_STARTED = "run.tool.started"
     RUN_TOOL_COMPLETED = "run.tool.completed"

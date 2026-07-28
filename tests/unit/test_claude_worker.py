@@ -264,6 +264,22 @@ def test_allowed_tools_flag_is_never_omitted():
         assert "Bash" not in ClaudeCodeAdapter._effective_allowed_tools(contract(risk, []))
 
 
+def test_no_tools_contract_gets_a_genuinely_empty_allow_list():
+    """A pure-conversation turn (casual chat) must resolve to zero tools -
+    not the R0-R3 safe-default fallback that an empty allowed_tools list
+    normally triggers. Regression: allowed_tools=[] is falsy in Python, so
+    without a distinct no_tools flag a "no tools" chat contract would
+    silently get Read/Grep/Glob anyway."""
+    from claude_worker.task_contract import TaskContract
+
+    chat_contract = TaskContract(
+        task_id="chat-1", mission="hi", context="", constraints=[],
+        allowed_tools=[], prohibited_actions=[], acceptance_criteria=[],
+        output_schema=None, timeout_seconds=60, risk_level="R0", no_tools=True,
+    )
+    assert ClaudeCodeAdapter._effective_allowed_tools(chat_contract) == []
+
+
 def test_parse_stream_line_captures_session_id_from_init_message():
     """A later human reply resumes this exact session (start_run's
     resume_session_id) - this is the only place that id is ever observed."""

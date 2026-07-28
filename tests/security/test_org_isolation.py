@@ -93,6 +93,8 @@ def two_orgs_with_goals():
     }
 
     db.execute(text("DELETE FROM goals WHERE organization_id IN (:a, :b)"), {"a": str(org_a.id), "b": str(org_b.id)})
+    db.execute(text("DELETE FROM chat_messages WHERE organization_id IN (:a, :b)"), {"a": str(org_a.id), "b": str(org_b.id)})
+    db.execute(text("DELETE FROM chat_sessions WHERE organization_id IN (:a, :b)"), {"a": str(org_a.id), "b": str(org_b.id)})
     db.execute(text("DELETE FROM sessions WHERE organization_id IN (:a, :b)"), {"a": str(org_a.id), "b": str(org_b.id)})
     db.execute(text("DELETE FROM users WHERE organization_id IN (:a, :b)"), {"a": str(org_a.id), "b": str(org_b.id)})
     db.execute(text("DELETE FROM organizations WHERE id IN (:a, :b)"), {"a": str(org_a.id), "b": str(org_b.id)})
@@ -136,3 +138,27 @@ def test_org_a_cannot_transition_org_bs_goal(client, two_orgs_with_goals):
         headers=_cookie_header(settings, two_orgs_with_goals["cookie_a"]),
     )
     assert resp.status_code == 404
+
+
+def test_org_a_chat_never_surfaces_org_bs_chat_messages(client, two_orgs_with_goals):
+    """The casual-chat surface (apps/api/app/routers/chat_views.py) keys its
+    single get-or-create ChatSession on organization_id - confirm org A
+    posting/listing never touches org B's session or messages, same as every
+    other org-scoped resource."""
+    settings = get_settings()
+
+    resp = client.post(
+        "/chat/messages", json={"content": "org b secret chat message"},
+        headers=_cookie_header(settings, two_orgs_with_goals["cookie_b"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get("/chat/messages", headers=_cookie_header(settings, two_orgs_with_goals["cookie_a"]))
+    assert resp.status_code == 200
+    bodies = [m["body"] for m in resp.json()]
+    assert "org b secret chat message" not in bodies
+
+    resp = client.get("/chat/messages", headers=_cookie_header(settings, two_orgs_with_goals["cookie_b"]))
+    assert resp.status_code == 200
+    bodies = [m["body"] for m in resp.json()]
+    assert "org b secret chat message" in bodies

@@ -15,7 +15,7 @@ from app.db import get_sessionmaker
 from app.logging_config import configure_logging
 from app.models.agents import AgentDefinition
 from app.realtime.ws_router import router as ws_router
-from app.routers import agents, approvals, audit, auth, goals, health, reliability_views, work_views
+from app.routers import agents, approvals, audit, auth, chat_views, goals, health, reliability_views, work_views
 
 import logging
 
@@ -88,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(approvals.router)
     app.include_router(audit.router)
     app.include_router(work_views.router)
+    app.include_router(chat_views.router)
     app.include_router(reliability_views.router)
     app.include_router(ws_router)
 

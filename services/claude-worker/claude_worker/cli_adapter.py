@@ -257,6 +257,8 @@ class ClaudeCodeAdapter:
         Falls back to a safe default when the contract names none, so the
         headless run is never left on the CLI's interactive default policy.
         """
+        if task.no_tools:
+            return []
         if task.allowed_tools:
             return list(task.allowed_tools)
         if task.risk_level in ("R0", "R1", "R2"):

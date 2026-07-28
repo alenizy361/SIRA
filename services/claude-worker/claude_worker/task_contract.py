@@ -26,3 +26,8 @@ class TaskContract:
     model: str | None = None
     effort: str | None = None
     max_budget_usd: float | None = None
+    # True for a pure-conversation turn (e.g. casual chat) that should never
+    # touch a tool, regardless of risk_level - distinct from allowed_tools
+    # being empty, which _effective_allowed_tools treats as "use the safe
+    # default for this risk tier", not "use none at all".
+    no_tools: bool = False

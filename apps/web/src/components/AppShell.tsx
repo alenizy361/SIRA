@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { authApi, ApiError } from "@/lib/api";
 import { NavShell } from "@/components/NavShell";
 import { RealtimeBridge } from "@/components/RealtimeBridge";
+import { ChatWidget } from "@/components/ChatWidget";
 
 const PUBLIC_PATHS = ["/login", "/onboarding"];
 
@@ -78,6 +79,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <NavShell me={me}>
       <RealtimeBridge />
       {children}
+      <ChatWidget />
     </NavShell>
   );
 }

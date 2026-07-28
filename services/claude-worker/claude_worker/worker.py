@@ -42,6 +42,16 @@ from .task_contract import TaskContract
 logger = logging.getLogger("claude_worker")
 
 POLL_INTERVAL_SECONDS = float(os.environ.get("CLAUDE_WORKER_POLL_INTERVAL", "5"))
+# Casual chat is a separate, lightweight surface from the goal/plan/task
+# pipeline (constitution: a plain "hi" should not spin up a full CEO planning
+# run and a multi-agent task tree). Cheapest/fastest current model, and
+# no_tools=True on the contract means the CLI can't be coaxed into touching
+# the filesystem for what is meant to be pure conversation.
+CHAT_MODEL = os.environ.get("CLAUDE_WORKER_CHAT_MODEL", "claude-haiku-4-5")
+# How long a claimed-but-unfinished chat turn is still treated as "in
+# flight" before another poll tick is allowed to reclaim it - guards against
+# a crashed worker leaving a session permanently stuck claimed.
+CHAT_CLAIM_TTL_SECONDS = 120
 WORKER_ID = os.environ.get("CLAUDE_WORKER_ID", f"claude-worker-{uuid.uuid4().hex[:8]}")
 
 
@@ -94,6 +104,29 @@ _GOAL_HAPPY_PATH = [
     GoalState.READY, GoalState.ASSIGNED, GoalState.RUNNING, GoalState.VALIDATING,
     GoalState.REVIEWING, GoalState.MEASURING, GoalState.COMPLETED,
 ]
+
+
+def _chat_contract(message_body: str, chat_session_id: uuid.UUID) -> TaskContract:
+    """A single turn of the lightweight, always-available casual-chat
+    surface - deliberately NOT a task: no goal, no plan, no multi-agent
+    tree, no filesystem access (no_tools=True), and the cheapest/fastest
+    current model rather than whatever the task pipeline would pick. This
+    is the "just reply" path the CEO itself recommended after repeatedly
+    seeing plain greetings routed through the full planning pipeline."""
+    return TaskContract(
+        task_id=f"chat-{chat_session_id}",
+        mission=message_body,
+        context="A casual conversational message - not a work request. Reply naturally and briefly.",
+        constraints=["Do not use any tools.", "Keep the reply conversational and brief."],
+        allowed_tools=[],
+        prohibited_actions=[],
+        acceptance_criteria=[],
+        output_schema=None,
+        timeout_seconds=60,
+        risk_level="R0",
+        model=CHAT_MODEL,
+        no_tools=True,
+    )
 
 
 def _advance_completed_goals(db, org_id) -> int:
@@ -231,6 +264,10 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
         #    existing CLI session rather than starting a fresh task.
         for task, message in _pending_reply_requests(db, org_id):
             executed += _execute_reply(db, adapter, task, message)
+        # 4. Pending casual-chat turns - the separate, always-available
+        #    conversational surface (no goal/plan/task involved at all).
+        for session, message in _pending_chat_requests(db, org_id):
+            executed += _execute_chat_turn(db, adapter, session, message)
     return executed
 
 
@@ -865,6 +902,147 @@ def _execute_reply(db, adapter: ClaudeCodeAdapter, task: Task, message) -> int:
         return 0
     finally:
         release_lease(db, task.id, worker_id=WORKER_ID)
+
+
+def _pending_chat_requests(db, org_id):
+    """ChatSessions whose latest ChatMessage is an unanswered human message
+    and are not currently claimed (or whose claim has gone stale past
+    CHAT_CLAIM_TTL_SECONDS - guards a crashed worker leaving a session
+    permanently stuck claimed). Mirrors _pending_reply_requests, but chat has
+    no Task/RunLease to anchor a lease to, so the claim lives directly on
+    ChatSession.claimed_at/claimed_by instead."""
+    from sqlalchemy import and_, func
+
+    from app.models.chat import ChatMessage, ChatSession
+
+    latest_ts = (
+        db.query(ChatMessage.chat_session_id, func.max(ChatMessage.created_at).label("max_ts"))
+        .filter(ChatMessage.organization_id == org_id)
+        .group_by(ChatMessage.chat_session_id)
+        .subquery()
+    )
+    pending_messages = (
+        db.query(ChatMessage)
+        .join(latest_ts, and_(
+            ChatMessage.chat_session_id == latest_ts.c.chat_session_id,
+            ChatMessage.created_at == latest_ts.c.max_ts,
+        ))
+        .filter(ChatMessage.role == "human")
+        .all()
+    )
+    if not pending_messages:
+        return []
+
+    now = datetime.now(timezone.utc)
+    out = []
+    for message in pending_messages:
+        session = (
+            db.query(ChatSession)
+            .filter(ChatSession.id == message.chat_session_id, ChatSession.organization_id == org_id)
+            .first()
+        )
+        if session is None:
+            continue
+        if session.claimed_at is not None:
+            claimed_at = session.claimed_at
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            if (now - claimed_at).total_seconds() < CHAT_CLAIM_TTL_SECONDS:
+                continue  # another tick (or a still-running worker) already has this
+        out.append((session, message))
+    return out
+
+
+def _execute_chat_turn(db, adapter: ClaudeCodeAdapter, session, message) -> int:
+    """Processes one pending human ChatMessage as the next turn of the org's
+    single casual-chat session - resumes the existing CLI session
+    (session.cli_session_id) if one exists, the same --resume pattern as
+    _execute_reply, but with no Task/Goal/Plan involved at all. Never touches
+    the goal/task FSM; this is a parallel, independent conversational
+    surface."""
+    from app.models.chat import ChatMessage, ChatSession
+
+    org_id = session.organization_id
+
+    # Claim atomically under a row lock, re-checking under the lock (mirrors
+    # the pattern in _run_pending_plans) so a second poll tick can never pick
+    # up the same pending message while this one is mid-flight.
+    locked = db.query(ChatSession).filter(ChatSession.id == session.id).with_for_update().one()
+    now = datetime.now(timezone.utc)
+    if locked.claimed_at is not None:
+        claimed_at = locked.claimed_at
+        if claimed_at.tzinfo is None:
+            claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+        if (now - claimed_at).total_seconds() < CHAT_CLAIM_TTL_SECONDS:
+            db.commit()  # release the row lock; someone else already has this
+            return 0
+    locked.claimed_at = now
+    locked.claimed_by = WORKER_ID
+    db.add(locked)
+    db.commit()
+    session = locked
+
+    try:
+        blocking_budget, warned_budgets = _budget_gate(db, org_id, None)
+        for wb in warned_budgets:
+            publish(
+                org_id, EventType.BUDGET_THRESHOLD_REACHED, "chat", str(session.id),
+                payload={
+                    "scope": wb.scope, "scope_ref": wb.scope_ref,
+                    "spent_amount": float(wb.spent_amount), "monthly_max": float(wb.monthly_max),
+                    "warn_percent": float(wb.warn_percent),
+                },
+            )
+        db.commit()
+        if blocking_budget is not None:
+            return 0
+
+        contract = _chat_contract(message.body, session.id)
+        handle, wait = adapter.start_run(
+            contract,
+            run_id=f"chat-{session.id}-{message.id}",
+            on_event=lambda ev: None,  # no_tools=True: nothing tool-shaped to forward
+            is_cancelled=lambda: False,  # chat has no Cancellation row to poll
+            resume_session_id=session.cli_session_id,
+        )
+        result = wait()
+
+        session.cli_session_id = result.cli_session_id or session.cli_session_id
+        # Chat has no Run row to key cost idempotency on - the message id is
+        # just as unique per turn, and serves the same purpose here.
+        _commit_run_cost(db, org_id, None, message.id, result.cost_usd)
+
+        if result.exit_code == 0 and not result.timed_out and not result.cancelled:
+            reply_body = result.result_summary or "(the agent produced no textual reply)"
+        else:
+            reply_body = f"(the agent failed to reply: exit={result.exit_code}, timed_out={result.timed_out})"
+
+        db.add(ChatMessage(
+            organization_id=org_id, chat_session_id=session.id, role="agent", body=reply_body,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.add(session)
+        db.commit()
+
+        publish(
+            org_id, EventType.CHAT_MESSAGE, "chat", str(session.id),
+            payload={"role": "agent", "body": reply_body},
+            entities=[EntityRef(type="chat_session", id=str(session.id))],
+        )
+        return 1
+    except Exception:  # noqa: BLE001 - never let one bad chat turn crash the poll tick
+        logger.exception("Unexpected error executing chat turn for session %s - leaving unanswered for retry", session.id)
+        db.rollback()
+        return 0
+    finally:
+        try:
+            db.refresh(session)
+            session.claimed_at = None
+            session.claimed_by = None
+            db.add(session)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
 
 
 def _mark_task_recoverable(db, task: "Task", run, org_id, actor: str) -> None:

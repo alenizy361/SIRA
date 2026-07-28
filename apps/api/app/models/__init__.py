@@ -3,6 +3,7 @@ autogenerate and for `Base.metadata.create_all()` in tests."""
 from app.db import Base  # noqa: F401
 from app.models import (  # noqa: F401
     agents,
+    chat,
     company,
     governance,
     identity,
