@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tan
 import { useI18n } from "@/i18n/I18nProvider";
 import { useToast } from "@/components/ToastProvider";
 import { NeuralCommandBoard } from "@/components/NeuralCommandBoard";
+import { AgentInspector } from "@/components/AgentInspector";
 import { GoalPlanPanel } from "@/components/GoalPlanPanel";
 import { VoiceCapture } from "@/components/VoiceCapture";
 import { SpeakButton } from "@/components/SpeakButton";
@@ -170,6 +171,8 @@ export default function CommandCenterPage() {
   // The goal whose CEO response we're showing. Set the moment you Send; falls
   // back to the most recent goal so a reload still shows the last answer.
   const [sentGoalId, setSentGoalId] = useState<string | null>(null);
+  // Which agent's live "what it's saying/doing" panel is open (click a capsule).
+  const [inspectAgent, setInspectAgent] = useState<string | null>(null);
 
   const coreState = useEventStore((s) => s.coreState);
   const wsStatus = useEventStore((s) => s.wsStatus);
@@ -373,7 +376,8 @@ export default function CommandCenterPage() {
 
         {/* center: the neural board */}
         <div className="order-1 min-w-0 xl:order-2">
-          <NeuralCommandBoard agents={agents} />
+          <NeuralCommandBoard agents={agents} onSelectAgent={setInspectAgent} />
+          <p className="mt-2 text-center text-[11px] text-slate-500">{t("command_center.inspector_hint")}</p>
         </div>
 
         {/* side B: live feed + system metrics */}
@@ -469,6 +473,15 @@ export default function CommandCenterPage() {
           )}
         </div>
       </div>
+
+      {/* Per-agent live view: exactly what this agent is saying and doing. */}
+      {inspectAgent ? (
+        <AgentInspector
+          agentKey={inspectAgent}
+          agents={agents}
+          onClose={() => setInspectAgent(null)}
+        />
+      ) : null}
     </div>
   );
 }

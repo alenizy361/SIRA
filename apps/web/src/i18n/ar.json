@@ -114,7 +114,10 @@
     "phase_received": "وصله أمر",
     "phase_working": "يعمل الآن",
     "phase_done": "أنجز",
-    "phase_blocked": "متوقف"
+    "phase_blocked": "متوقف",
+    "inspector_idle": "الوكيل خامل الآن",
+    "inspector_empty": "لا نشاط لهذا الوكيل بعد. حين يبدأ العمل سترى هنا كل ما يقوله ويفعله لحظياً.",
+    "inspector_hint": "اضغط على أي وكيل في اللوحة لرؤية ما يقوله ويفعله"
   },
   "goals": {
     "title": "الأهداف",

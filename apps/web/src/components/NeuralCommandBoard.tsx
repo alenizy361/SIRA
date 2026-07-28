@@ -86,7 +86,13 @@ interface BoardNode {
 
 interface Pulse { node: BoardNode; t: number; sp: number }
 
-export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
+export function NeuralCommandBoard({
+  agents,
+  onSelectAgent,
+}: {
+  agents: AgentLite[];
+  onSelectAgent?: (agentKey: string) => void;
+}) {
   const { locale, t } = useI18n();
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -474,13 +480,17 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
             title={nameFor(n.key)}
             dir={locale === "ar" ? "rtl" : "ltr"}
           >
-            <div
-              className="flex items-center gap-2 whitespace-nowrap rounded-full border px-2.5 py-1.5"
+            <button
+              type="button"
+              onClick={() => onSelectAgent?.(n.key)}
+              className="flex items-center gap-2 whitespace-nowrap rounded-full border px-2.5 py-1.5 transition-transform hover:scale-105 focus:outline-none focus-visible:ring-2"
               style={{
                 borderColor: ring,
                 background: "rgba(6,8,20,0.82)",
                 boxShadow: phase ? `0 0 14px ${ring}${active ? "aa" : "66"}` : undefined,
+                cursor: onSelectAgent ? "pointer" : "default",
               }}
+              aria-label={nameFor(n.key)}
             >
               <span
                 className={`relative grid h-8 w-8 flex-none place-items-center rounded-full border text-[10px] font-bold max-[860px]:h-7 max-[860px]:w-7 ${
@@ -510,7 +520,7 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
                   </span>
                 ) : null}
               </span>
-            </div>
+            </button>
             {/* phone view: no name, so show a tiny status dot under the glyph */}
             {phaseLabel ? (
               <span

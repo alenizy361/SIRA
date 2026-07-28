@@ -114,7 +114,10 @@
     "phase_received": "command received",
     "phase_working": "working now",
     "phase_done": "done",
-    "phase_blocked": "blocked"
+    "phase_blocked": "blocked",
+    "inspector_idle": "This agent is idle right now",
+    "inspector_empty": "No activity for this agent yet. When it starts working you'll see everything it says and does here, live.",
+    "inspector_hint": "Click any agent on the board to see what it's saying and doing"
   },
   "goals": {
     "title": "Goals",
