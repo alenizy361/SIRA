@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session as DbSession
 
 from app.auth.dependencies import get_current_user
@@ -143,3 +143,69 @@ def emergency_stop(user: User = Depends(get_current_user), db: DbSession = Depen
     )
     db.commit()
     return {"status": "stopped", "autonomy_mode": "observe_only", "leases_revoked": revoked}
+
+
+# Modes in which the host worker will actually execute work. Must stay in sync
+# with claude_worker.worker.AUTONOMOUS_EXECUTION_MODES - a mode outside this set
+# means the worker skips the organization entirely.
+RESUMABLE_MODES = ("execute_low_risk", "controlled_autonomous")
+
+
+@router.get("/system/autonomy")
+def get_autonomy(user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+    """Current autonomy mode + whether the company will actually act.
+
+    Without this the dashboard could not tell the difference between "running"
+    and "stopped": the worker can be alive and authenticated while the org sits
+    in observe_only, in which case every goal you send is silently ignored.
+    """
+    from app.models.identity import Organization
+
+    org = db.get(Organization, user.organization_id)
+    mode = org.autonomy_mode if org else "unknown"
+    return {
+        "autonomy_mode": mode,
+        "executing": mode in RESUMABLE_MODES,
+    }
+
+
+@router.post("/system/resume")
+def resume(user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+    """Undo an emergency stop: return the organization to an executing autonomy
+    mode so queued goals are picked up again.
+
+    Emergency stop used to be a ONE-WAY DOOR - autonomy_mode was set to
+    observe_only and nothing anywhere could set it back, so a single press (or
+    a stray API call) froze the company permanently while the dashboard kept
+    reporting a healthy worker. Stopping must always be reversible by the same
+    operator who can stop it.
+    """
+    from app.models.identity import Organization
+
+    org = db.get(Organization, user.organization_id)
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    previous = org.autonomy_mode
+    if previous in RESUMABLE_MODES:
+        # Already running - report it plainly instead of pretending we changed
+        # something, so the UI never claims a resume that was a no-op.
+        return {"status": "already_running", "autonomy_mode": previous, "changed": False}
+
+    org.autonomy_mode = "execute_low_risk"
+    db.add(org)
+    db.add(
+        AuditLog(
+            organization_id=user.organization_id,
+            actor_type="user",
+            actor_id=str(user.id),
+            action="system.resume",
+            entity_type="organization",
+            entity_id=str(user.organization_id),
+            result="executed",
+            explanation=f"Autonomy mode restored: {previous} -> execute_low_risk.",
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+    return {"status": "resumed", "autonomy_mode": "execute_low_risk", "previous": previous, "changed": True}

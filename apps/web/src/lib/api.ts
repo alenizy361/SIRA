@@ -227,8 +227,17 @@ export const healthApi = {
   worker: () => api.get<WorkerStatus>("/health/worker"),
 };
 
+export interface AutonomyStatus {
+  autonomy_mode: string;
+  /** False when the org is stopped/observe_only - the worker ignores it entirely. */
+  executing: boolean;
+}
+
 export const systemApi = {
   emergencyStop: () => api.post<{ status: string }>("/system/emergency-stop"),
+  autonomy: () => api.get<AutonomyStatus>("/system/autonomy"),
+  resume: () =>
+    api.post<{ status: string; autonomy_mode: string; changed: boolean }>("/system/resume"),
 };
 
 // ---- Endpoints not yet implemented on the backend (see docs/BUILD_STATUS.md).

@@ -237,3 +237,49 @@ def test_goal_plan_endpoint_returns_ceo_response(client):
     assert task["agent_key"] == "frontend_engineer"
     assert task["risk_level"] == "R1"
     assert task["title"] == "Build the hero section"
+
+
+def test_emergency_stop_is_reversible(client):
+    """Emergency stop used to be a ONE-WAY DOOR: autonomy_mode was set to
+    observe_only and nothing anywhere could set it back, so one press froze the
+    company forever while the dashboard still reported a healthy worker and
+    every goal you sent was silently ignored by the host worker (which skips
+    any org whose mode is not an executing one). Stopping must be reversible,
+    and the UI must be able to SEE the stopped state."""
+    login = client.post(
+        "/auth/login",
+        json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"},
+    )
+    assert login.status_code == 200, login.text
+
+    # Establish a known baseline rather than assuming one: an earlier test in
+    # this module presses emergency stop and never resumes, which is exactly
+    # the real-world trap this endpoint exists to escape.
+    client.post("/system/resume")
+    before = client.get("/system/autonomy").json()
+    assert before["executing"] is True, before
+
+    stop = client.post("/system/emergency-stop")
+    assert stop.status_code == 200
+    stopped = client.get("/system/autonomy").json()
+    assert stopped["autonomy_mode"] == "observe_only"
+    # This is the flag the dashboard needs to stop claiming "running".
+    assert stopped["executing"] is False
+
+    resumed = client.post("/system/resume")
+    assert resumed.status_code == 200, resumed.text
+    body = resumed.json()
+    assert body["changed"] is True
+    assert body["previous"] == "observe_only"
+
+    after = client.get("/system/autonomy").json()
+    assert after["executing"] is True
+    assert after["autonomy_mode"] == "execute_low_risk"
+
+    # Resuming an already-running company is a no-op, and says so honestly
+    # rather than reporting a change that did not happen.
+    again = client.post("/system/resume").json()
+    assert again["changed"] is False and again["status"] == "already_running"
+
+    audit = client.get("/audit-logs").json()
+    assert any(a["action"] == "system.resume" for a in audit)

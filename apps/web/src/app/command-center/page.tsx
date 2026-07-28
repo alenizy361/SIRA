@@ -193,6 +193,24 @@ export default function CommandCenterPage() {
     refetchInterval: 8_000,
   });
 
+  // Is the company allowed to act at all? A live, authenticated worker still
+  // does NOTHING while the org sits in observe_only after an emergency stop -
+  // without this the banner would claim "running" while every goal is ignored.
+  const autonomyQuery = useQuery({
+    queryKey: ["autonomy"],
+    queryFn: systemApi.autonomy,
+    refetchInterval: 10_000,
+  });
+
+  const resume = useMutation({
+    mutationFn: systemApi.resume,
+    onSuccess: () => {
+      toast.show(t("command_center.resumed"), "success");
+      queryClient.invalidateQueries({ queryKey: ["autonomy"] });
+    },
+    onError: () => toast.show(t("command_center.resume_failed"), "error"),
+  });
+
   const requestPlan = useMutation({
     mutationFn: (goalId: string) => goalsApi.requestPlan(goalId),
     onSuccess: () => {
@@ -295,7 +313,26 @@ export default function CommandCenterPage() {
       {/* Company status banner - the honest answer to "is anything actually
           going to happen when I send a command?". Reads the host worker's
           heartbeat: running / asleep (not logged in) / down. */}
-      <WorkerBanner query={workerQuery} />
+      {/* A stopped company outranks worker health: the worker can be perfectly
+          alive while the org is frozen in observe_only, in which case every
+          command is silently discarded. Say so, and offer the way back. */}
+      {autonomyQuery.data && !autonomyQuery.data.executing ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-2xl border border-red-400/40 bg-red-500/[0.10] px-4 py-3">
+          <span className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-red-400 shadow-[0_0_10px_#f87171]" aria-hidden />
+          <span className="text-sm font-semibold text-red-200">{t("command_center.company_stopped")}</span>
+          <span className="text-[11px] text-red-300/80">{t("command_center.company_stopped_hint")}</span>
+          <button
+            type="button"
+            onClick={() => resume.mutate()}
+            disabled={resume.isPending}
+            className="ms-auto min-h-[36px] rounded-xl bg-emerald-500 px-4 text-sm font-bold text-slate-950 transition-opacity hover:opacity-90 disabled:opacity-40"
+          >
+            {t("command_center.resume")}
+          </button>
+        </div>
+      ) : (
+        <WorkerBanner query={workerQuery} />
+      )}
 
       {/* The CEO's response to your last command - the readable answer, right
           where you'd look for it. Shows "planning now" then the plan + tasks. */}

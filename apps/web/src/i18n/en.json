@@ -117,7 +117,12 @@
     "phase_blocked": "blocked",
     "inspector_idle": "This agent is idle right now",
     "inspector_empty": "No activity for this agent yet. When it starts working you'll see everything it says and does here, live.",
-    "inspector_hint": "Click any agent on the board to see what it's saying and doing"
+    "inspector_hint": "Click any agent on the board to see what it's saying and doing",
+    "company_stopped": "Company is STOPPED (emergency stop) — nothing you send will run",
+    "company_stopped_hint": "Press Resume to bring the agents back",
+    "resume": "Resume",
+    "resumed": "Company resumed — agents are working again",
+    "resume_failed": "Could not resume"
   },
   "goals": {
     "title": "Goals",
