@@ -79,7 +79,10 @@ def test_poll_tick_executes_ready_task_and_advances_state(db, org_id, monkeypatc
     assert executed == 1
 
     db.refresh(task)
-    assert task.state == "validating"
+    # A clean run must drive the task all the way to a terminal COMPLETED - not
+    # strand it in VALIDATING (there is no separate reviewer agent to finish it,
+    # so a task left "validating" would never complete and the goal would hang).
+    assert task.state == "completed"
 
 
 def test_unexpected_run_error_lands_task_in_retry_wait_not_stuck_running(db, org_id, monkeypatch):

@@ -79,7 +79,7 @@ def test_task_execution_publishes_real_events_over_redis_pubsub(db, org_id, monk
         msg = pubsub.get_message(timeout=0.2)
         if msg and msg.get("type") == "message":
             received.append(json.loads(msg["data"]))
-        if len(received) >= 9:
+        if len(received) >= 10:
             break
     pubsub.close()
 
@@ -91,6 +91,9 @@ def test_task_execution_publishes_real_events_over_redis_pubsub(db, org_id, monk
     assert "run.tool.completed" in types_seen
     assert "run.output.delta" in types_seen
     assert "task.progress" in types_seen
+    # A clean run must announce that the task actually COMPLETED - the dashboard
+    # (and the neural board's per-agent "done" state) depends on this event.
+    assert "task.completed" in types_seen
 
     core_state_events = [e for e in received if e["type"] == "core.state.changed"]
     core_states = [e["payload"]["state"] for e in core_state_events]

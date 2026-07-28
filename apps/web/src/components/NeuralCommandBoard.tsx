@@ -1,10 +1,30 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
-import { useEventStore } from "@/store/eventStore";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useEventStore, type AgentActivity, type AgentPhase } from "@/store/eventStore";
 import { agentMeta } from "@/lib/agentMeta";
 import { coreStateColor } from "@/components/AICore";
 import { useI18n } from "@/i18n/I18nProvider";
+
+// How long an agent stays visibly "active" after its last working event, and
+// how long a terminal (done/blocked) badge lingers before the capsule rests.
+const ACTIVE_TTL = 120_000;
+const TERMINAL_TTL = 12_000;
+
+/** The activity still worth showing, given how long ago it happened. */
+function livePhase(a: AgentActivity | undefined, now: number): AgentPhase | null {
+  if (!a) return null;
+  const age = now - a.since;
+  if (a.phase === "working" || a.phase === "received") return age < ACTIVE_TTL ? a.phase : null;
+  return age < TERMINAL_TTL ? a.phase : null;
+}
+
+const PHASE_COLOR: Record<AgentPhase, string> = {
+  received: "#fbbf24",
+  working: "#22d3ee",
+  done: "#34d399",
+  blocked: "#fb7185",
+};
 
 interface AgentLite {
   agent_key: string;
@@ -61,17 +81,27 @@ interface BoardNode {
   rgb: Rgb;
   glow: number;
   seed: number;
+  active: boolean; // held true while its agent is received/working
 }
 
 interface Pulse { node: BoardNode; t: number; sp: number }
 
 export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
-  const { locale } = useI18n();
+  const { locale, t } = useI18n();
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const events = useEventStore((s) => s.events);
   const coreState = useEventStore((s) => s.coreState);
+  const agentActivity = useEventStore((s) => s.agentActivity);
   const lastSeqRef = useRef(-1);
+
+  // A 1s tick so the DOM capsules re-evaluate their live phase (fade a "done"
+  // badge, drop a stale "working" ring) even when no new event arrives.
+  const [, setNow] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setNow((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // Mutable scene state lives in refs so the RAF loop never re-renders React.
   const sceneRef = useRef<{
@@ -80,7 +110,13 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
     burst: number;
     burstColor: Rgb | null;
     stateTint: Rgb;
-  }>({ nodes: [], pulses: [], burst: 0, burstColor: null, stateTint: CYAN });
+    frame: number;
+  }>({ nodes: [], pulses: [], burst: 0, burstColor: null, stateTint: CYAN, frame: 0 });
+
+  // Live activity for the RAF loop (kept in a ref so the canvas effect, which
+  // mounts once, always sees the freshest map without re-subscribing).
+  const activityRef = useRef<Record<string, AgentActivity>>({});
+  activityRef.current = agentActivity;
 
   const nodes = useMemo<BoardNode[]>(
     () =>
@@ -91,6 +127,7 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
         rgb: hexRgb(agentMeta(b.key).color),
         glow: 0,
         seed: i * 17.3,
+        active: false,
       })),
     []
   );
@@ -264,6 +301,27 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
         ctx!.stroke();
       }
 
+      // Hold WORKING/RECEIVED agents visibly alive: keep the tendril hot and
+      // stream a steady trickle of sparks into the core for as long as the
+      // agent works, so an active link reads as a living connection - not a
+      // one-frame flash. Driven entirely by the real event-derived activity.
+      sc.frame++;
+      const nowMs = Date.now();
+      const act = activityRef.current;
+      for (const n of sc.nodes) {
+        const lp = livePhase(act[n.key], nowMs);
+        n.active = lp === "working" || lp === "received";
+        if (n.active) {
+          const pulse = 0.55 + 0.35 * Math.sin(nowMs / 320 + n.seed);
+          if (n.glow < pulse) n.glow = pulse; // floor: never fully fade while active
+          // A spark roughly every ~0.6s per working agent (36 frames @ 60fps),
+          // phase-staggered by seed so multiple agents don't pulse in lockstep.
+          if (lp === "working" && (sc.frame + Math.floor(n.seed)) % 36 === 0) {
+            sc.pulses.push({ node: n, t: 0, sp: 0.02 });
+          }
+        }
+      }
+
       // tendrils + sparks
       for (const n of sc.nodes) tendril(n, t);
       for (let i = sc.pulses.length - 1; i >= 0; i--) {
@@ -368,6 +426,10 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
     };
   }, []);
 
+  // Render-scope clock (re-read every 1s via the ticker) so capsules fade
+  // their live phase in step with the canvas.
+  const nowMs = Date.now();
+
   return (
     <div
       ref={stageRef}
@@ -395,36 +457,90 @@ export function NeuralCommandBoard({ agents }: { agents: AgentLite[] }) {
         </div>
       </div>
 
-      {/* agent capsules */}
+      {/* agent capsules - each reflects its LIVE phase (received/working/
+          done/blocked) so you can see a command land on an agent and the
+          agent stay lit while it works. */}
       {nodes.map((n) => {
         const meta = agentMeta(n.key);
+        const phase = livePhase(agentActivity[n.key], nowMs);
+        const active = phase === "working" || phase === "received";
+        const ring = phase ? PHASE_COLOR[phase] : `${meta.color}55`;
+        const phaseLabel = phase ? t(`command_center.phase_${phase}`) : null;
         return (
           <div
             key={n.key}
-            className="neural-capsule absolute z-[3] flex -translate-x-1/2 -translate-y-1/2 items-center gap-2 whitespace-nowrap rounded-full border px-2.5 py-1.5"
-            style={{
-              left: `${n.x}%`,
-              top: `${n.y}%`,
-              borderColor: `${meta.color}55`,
-              background: "rgba(6,8,20,0.82)",
-            }}
+            className="neural-capsule absolute z-[3] flex -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-1"
+            style={{ left: `${n.x}%`, top: `${n.y}%` }}
             title={nameFor(n.key)}
             dir={locale === "ar" ? "rtl" : "ltr"}
           >
-            <span
-              className="grid h-8 w-8 flex-none place-items-center rounded-full border text-[10px] font-bold max-[860px]:h-7 max-[860px]:w-7"
-              style={{ borderColor: meta.color, color: meta.color, background: `${meta.color}22` }}
+            <div
+              className="flex items-center gap-2 whitespace-nowrap rounded-full border px-2.5 py-1.5"
+              style={{
+                borderColor: ring,
+                background: "rgba(6,8,20,0.82)",
+                boxShadow: phase ? `0 0 14px ${ring}${active ? "aa" : "66"}` : undefined,
+              }}
             >
-              {meta.glyph}
-            </span>
-            <span className="max-[860px]:hidden">
-              <span className="block max-w-[16ch] truncate text-[11px] font-bold uppercase tracking-wide text-slate-100">
-                {nameFor(n.key)}
+              <span
+                className={`relative grid h-8 w-8 flex-none place-items-center rounded-full border text-[10px] font-bold max-[860px]:h-7 max-[860px]:w-7 ${
+                  active ? "capsule-pulse" : ""
+                }`}
+                style={{
+                  borderColor: meta.color,
+                  color: meta.color,
+                  background: `${meta.color}22`,
+                  // CSS var drives the pulse ring color for active agents.
+                  ["--ring" as string]: ring,
+                }}
+              >
+                {meta.glyph}
               </span>
-            </span>
+              <span className="max-[860px]:hidden">
+                <span className="block max-w-[16ch] truncate text-[11px] font-bold uppercase tracking-wide text-slate-100">
+                  {nameFor(n.key)}
+                </span>
+                {phaseLabel ? (
+                  <span
+                    className="block max-w-[16ch] truncate text-[9.5px] font-semibold"
+                    style={{ color: ring }}
+                  >
+                    {active ? "● " : ""}
+                    {phaseLabel}
+                  </span>
+                ) : null}
+              </span>
+            </div>
+            {/* phone view: no name, so show a tiny status dot under the glyph */}
+            {phaseLabel ? (
+              <span
+                className="hidden max-w-[12ch] truncate rounded-full px-1.5 text-[8px] font-bold max-[860px]:inline-block"
+                style={{ color: ring, background: `${ring}22` }}
+              >
+                {phaseLabel}
+              </span>
+            ) : null}
           </div>
         );
       })}
+
+      <style jsx>{`
+        .capsule-pulse::after {
+          content: "";
+          position: absolute;
+          inset: -3px;
+          border-radius: 9999px;
+          border: 2px solid var(--ring);
+          animation: capsuleRing 1.4s ease-out infinite;
+        }
+        @keyframes capsuleRing {
+          0% { transform: scale(1); opacity: 0.9; }
+          100% { transform: scale(1.6); opacity: 0; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .capsule-pulse::after { animation: none; opacity: 0.5; }
+        }
+      `}</style>
     </div>
   );
 }

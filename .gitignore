@@ -22,3 +22,7 @@ infra/backup/*
 
 *.log
 .DS_Store
+
+# Redis dump artifact (never commit runtime state)
+dump.rdb
+*.rdb

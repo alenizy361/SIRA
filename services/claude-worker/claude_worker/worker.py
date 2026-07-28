@@ -344,14 +344,26 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
 
         publish_core_state(org_id, CoreState.REVIEWING, actor, str(task.id))
         if run.state == "validating":
-            next_state = TaskState.VALIDATING
+            # SUCCESS: drive the task through validation + review to COMPLETED
+            # and announce it. This build has no separate validator/reviewer
+            # agent consuming the VALIDATING/REVIEWING states, so a clean run
+            # finalizes the task here. Without this the task would sit in
+            # VALIDATING forever - the goal would never finish and the
+            # dashboard would never see a task actually complete.
             publish(org_id, EventType.TASK_PROGRESS, actor, str(task.id), payload={"stage": "validating"}, entities=_task_entities(task, run))
+            for target in (TaskState.VALIDATING, TaskState.REVIEWING, TaskState.COMPLETED):
+                task.state = transition_task(TaskState(task.state), target).value
+            run.state = "completed"
+            run.finished_at = datetime.now(timezone.utc)
+            db.add(task)
+            db.add(run)
+            db.commit()
+            publish(org_id, EventType.TASK_COMPLETED, actor, str(task.id), payload={"title": task.title}, entities=_task_entities(task, run))
         else:
-            next_state = TaskState.RETRY_WAIT
             publish(org_id, EventType.TASK_BLOCKED, actor, str(task.id), payload={"reason": "run_failed_or_timed_out"}, entities=_task_entities(task, run))
-        task.state = transition_task(TaskState(task.state), next_state).value
-        db.add(task)
-        db.commit()
+            task.state = transition_task(TaskState(task.state), TaskState.RETRY_WAIT).value
+            db.add(task)
+            db.commit()
         publish_core_state(org_id, CoreState.IDLE, actor, str(task.id))
         return 1
     except AuthenticationRequiredError:

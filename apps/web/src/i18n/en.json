@@ -110,7 +110,11 @@
     "plan_tasks": "Tasks",
     "no_plan_yet": "Planning hasn't been requested for this goal yet.",
     "open_goal": "Open the full goal",
-    "assigned_to": "Assigned to"
+    "assigned_to": "Assigned to",
+    "phase_received": "command received",
+    "phase_working": "working now",
+    "phase_done": "done",
+    "phase_blocked": "blocked"
   },
   "goals": {
     "title": "Goals",

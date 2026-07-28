@@ -110,7 +110,11 @@
     "plan_tasks": "المهام",
     "no_plan_yet": "لم يُطلب التخطيط لهذا الهدف بعد.",
     "open_goal": "افتح الهدف كاملاً",
-    "assigned_to": "المسؤول"
+    "assigned_to": "المسؤول",
+    "phase_received": "وصله أمر",
+    "phase_working": "يعمل الآن",
+    "phase_done": "أنجز",
+    "phase_blocked": "متوقف"
   },
   "goals": {
     "title": "الأهداف",
