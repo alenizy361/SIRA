@@ -59,7 +59,47 @@ class PlanningError(Exception):
     pass
 
 
-def _build_ceo_task_contract(goal: Goal, valid_agent_keys: set[str]) -> TaskContract:
+def _recent_company_history(db, organization_id, exclude_goal_id, limit: int = 5) -> str:
+    """A short digest of the organization's recent goals, so the CEO isn't
+    planning in a total vacuum.
+
+    Every goal used to be planned with ONLY its own title+description as
+    context - no visibility into anything the company had done before. A
+    follow-up message referencing earlier work ("did the previous request
+    finish?", "continue what we started", "why did that fail?") had nothing
+    to actually continue: each "conversation" was really a sequence of
+    unrelated, memory-less one-shot commands. Real multi-agent systems keep a
+    shared context layer for exactly this reason. This stays intentionally
+    small - titles, states, and one-line plan summaries (a few hundred
+    tokens), not full conversation forwarding - matching the industry pattern
+    of passing compact structured context rather than raw history.
+    """
+    from app.models.work import Plan
+
+    recent = (
+        db.query(Goal)
+        .filter(Goal.organization_id == organization_id, Goal.id != exclude_goal_id)
+        .order_by(Goal.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    if not recent:
+        return "No prior goals - this is the first request made to this company."
+
+    lines = []
+    for g in recent:
+        plan = (
+            db.query(Plan)
+            .filter(Plan.goal_id == g.id)
+            .order_by(Plan.created_at.desc())
+            .first()
+        )
+        summary = f" - {plan.summary[:200]}" if plan and plan.summary else ""
+        lines.append(f"- [{g.state}] {g.title}{summary}")
+    return "Recent company history, most recent first (for continuity only - this new goal is the one to plan):\n" + "\n".join(lines)
+
+
+def _build_ceo_task_contract(goal: Goal, valid_agent_keys: set[str], recent_history: str) -> TaskContract:
     return TaskContract(
         task_id=f"plan-{uuid4().hex[:12]}",
         mission=(
@@ -71,7 +111,9 @@ def _build_ceo_task_contract(goal: Goal, valid_agent_keys: set[str]) -> TaskCont
             "human approval and cannot be auto-planned here). Respond ONLY with the JSON object "
             "matching the required schema - no prose outside it."
         ),
-        context=f"Goal title: {goal.title}\nGoal description: {goal.description}",
+        context=(
+            f"Goal title: {goal.title}\nGoal description: {goal.description}\n\n{recent_history}"
+        ),
         constraints=[
             "Every task's agent_key must be one of the allowed agent keys listed in the mission.",
             "Every task's risk_level must be R0, R1, or R2.",
@@ -103,7 +145,8 @@ def plan_goal(db, goal: Goal) -> Plan:
         raise PlanningError("No agent definitions loaded - cannot plan without a valid agent_key allowlist")
 
     adapter = ClaudeCodeAdapter(cli_path=settings.claude_cli_path, workspace_root=settings.claude_worker_workspace_root)
-    contract = _build_ceo_task_contract(goal, valid_agent_keys)
+    recent_history = _recent_company_history(db, goal.organization_id, goal.id)
+    contract = _build_ceo_task_contract(goal, valid_agent_keys, recent_history)
 
     try:
         _handle, wait = adapter.start_run(contract)
