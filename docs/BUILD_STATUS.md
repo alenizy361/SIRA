@@ -122,11 +122,21 @@ with `uvicorn` and exercised over real HTTP with `curl`.
    claude-worker) are real and tested in isolation, but a route that
    chains "goal created → CEO agent plans it → tasks created" does not
    exist yet. Today, `POST /goals` only creates the goal row.
-5. **`tests/security` and `tests/load` directories are still empty** -
-   the permission-engine tests cover policy-level security logic, and the
-   auth flow was manually verified (lockout, session revocation, duplicate
-   onboarding rejection), but a dedicated prompt-injection test suite and
-   load tests have not been written yet.
+5. **`tests/security` now has 22 passing tests** (prompt-injection
+   structural guarantees, command-injection/shell=True AST check,
+   cross-organization data isolation with a second org inserted directly
+   via SQL). Writing them **found and fixed a real path-traversal bug**:
+   `services/claude-worker/claude_worker/cli_adapter.py`'s
+   `_create_worktree` built `f"{repo.name}-{task_id}"` and joined it under
+   `.worktrees` - pathlib splits embedded `/`/`..` in that string into real
+   path components on join, so a task_id like `"../../../../tmp/pwned"`
+   resolved clean outside the workspace root entirely (verified with a
+   throwaway `Path` test before fixing it). Fixed by rejecting any
+   `task_id`/would-be path component that isn't a plain
+   `[A-Za-z0-9._-]+` slug, plus a post-resolve containment check, in
+   `_safe_path_component()`. See `tests/security/test_command_injection.py`
+   for the regression test. **`tests/load` is still empty** - no load
+   tests written yet.
 6. Everything in this sandbox runs as **root** (the container's only user)
    rather than the non-root `aicompany` service account the constitution
    requires. The code (systemd units, claude-worker adapter) is written to

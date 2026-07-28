@@ -28,6 +28,19 @@ from .task_contract import TaskContract
 
 THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 
+_SAFE_PATH_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_path_component(value: str) -> str:
+    """Raises WorkspaceEscapeError if `value` is not safe to embed as a
+    single filesystem path component (no separators, no '..', no leading
+    dot-dot tricks) - see _create_worktree for why this matters."""
+    if not value or value in (".", "..") or not _SAFE_PATH_COMPONENT_PATTERN.match(value):
+        raise WorkspaceEscapeError(
+            f"'{value}' is not a safe path component (must match {_SAFE_PATH_COMPONENT_PATTERN.pattern})"
+        )
+    return value
+
 
 class AuthenticationRequiredError(Exception):
     pass
@@ -155,9 +168,23 @@ class ClaudeCodeAdapter:
         return candidate
 
     def _create_worktree(self, repo_path: Path, task_id: str, branch_name: str | None) -> tuple[Path, str]:
-        branch = branch_name or f"agent/task-{task_id}"
-        worktree_dir = repo_path.parent / f".worktrees" / f"{repo_path.name}-{task_id}"
+        # task_id can originate from a Task row created via the API - it must
+        # be treated as untrusted input here. A task_id containing path
+        # separators (e.g. "../../../../tmp/pwned") would otherwise let the
+        # f-string below escape .worktrees entirely once resolved by pathlib,
+        # since `/` joins are split into real path components regardless of
+        # how many separators arrived in one string. Reject anything that
+        # isn't a safe single path-component slug.
+        safe_task_id = _safe_path_component(task_id)
+        branch = branch_name or f"agent/task-{safe_task_id}"
+        worktree_dir = repo_path.parent / ".worktrees" / f"{repo_path.name}-{safe_task_id}"
         worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        resolved = worktree_dir.resolve()
+        expected_parent = (repo_path.parent / ".worktrees").resolve()
+        if expected_parent not in resolved.parents:
+            raise WorkspaceEscapeError(f"Computed worktree path '{resolved}' escapes '.worktrees'")
+
         subprocess.run(
             ["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree_dir), "HEAD"],
             check=True,
