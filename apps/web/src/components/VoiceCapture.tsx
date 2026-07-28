@@ -16,6 +16,7 @@ interface SpeechRecognitionLike extends EventTarget {
   interimResults: boolean;
   start: () => void;
   stop: () => void;
+  abort?: () => void;
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
   onerror: ((event: Event) => void) | null;
   onend: (() => void) | null;
@@ -45,6 +46,17 @@ export function VoiceCapture({
 
   useEffect(() => {
     setSupported(!!getSpeechRecognitionCtor());
+    // Tear down any active recognition on unmount so the microphone can't keep
+    // capturing after the voice UI is gone (e.g. navigating away mid-capture).
+    return () => {
+      try {
+        recognitionRef.current?.abort?.();
+        recognitionRef.current?.stop?.();
+      } catch {
+        // best-effort teardown
+      }
+      recognitionRef.current = null;
+    };
   }, []);
 
   function startListening() {

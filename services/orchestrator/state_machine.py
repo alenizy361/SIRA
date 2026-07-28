@@ -69,7 +69,10 @@ _GOAL_TRANSITIONS: dict[GoalState, set[GoalState]] = {
 
 _TASK_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     TaskState.READY: {TaskState.ASSIGNED, TaskState.CANCELLED},
-    TaskState.ASSIGNED: {TaskState.RUNNING, TaskState.CANCELLED},
+    # ASSIGNED -> RETRY_WAIT: a task can fail (or its worker die) after being
+    # leased/assigned but before RUNNING commits - it must be recoverable, not
+    # a permanent trap.
+    TaskState.ASSIGNED: {TaskState.RUNNING, TaskState.RETRY_WAIT, TaskState.CANCELLED},
     TaskState.RUNNING: {
         TaskState.VALIDATING,
         TaskState.RETRY_WAIT,

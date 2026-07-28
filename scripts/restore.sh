@@ -60,17 +60,42 @@ CHANGES=()
 
 if [[ "$HAS_DB" == "true" ]]; then
   log_step "Restoring Postgres database '${DB_NAME}'"
+  # Stop the app + worker FIRST so nothing reads/writes the target DB while
+  # pg_restore --clean drops and recreates tables (otherwise DROPs interleave
+  # with live queries and leave a half-restored, inconsistent database).
+  if is_systemd_pid1; then
+    for unit in rabit-claude-worker.service rabit-web.service rabit-api.service; do
+      systemctl stop "$unit" 2>/dev/null || true
+    done
+  else
+    compose stop api web 2>/dev/null || true
+  fi
+
   compose up -d postgres
   wait_for_container_healthy postgres 90 || die "postgres did not become healthy — aborting before touching data."
+  # Terminate any lingering connections to the target DB so DROPs don't block.
+  compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -d postgres -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DB_NAME}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
   compose cp "$BACKUP_DIR/postgres_${DB_NAME}.dump" "postgres:/tmp/manual_restore.dump"
   if compose exec -T postgres pg_restore -U "${POSTGRES_USER:-postgres}" -d "$DB_NAME" --clean --if-exists /tmp/manual_restore.dump; then
     log_ok "Database restored"
     CHANGES+=("Postgres database '${DB_NAME}' restored from ${BACKUP_DIR}/postgres_${DB_NAME}.dump")
+    compose exec -T postgres rm -f /tmp/manual_restore.dump || true
   else
-    log_warn "pg_restore reported errors (often harmless 'does not exist' notices with --clean). Verify with scripts/doctor.sh."
-    CHANGES+=("Postgres database '${DB_NAME}' restore attempted with warnings — verify manually")
+    # --if-exists already suppresses the benign 'does not exist' notices, so a
+    # non-zero exit here is a REAL failure - do not report success on a
+    # possibly half-restored database with services about to restart onto it.
+    compose exec -T postgres rm -f /tmp/manual_restore.dump || true
+    die "pg_restore FAILED for '${DB_NAME}'. The database may be partially restored. Do NOT restart services against it - investigate the dump, then re-run restore."
   fi
-  compose exec -T postgres rm -f /tmp/manual_restore.dump || true
+  # Bring the app back up now that the DB is consistent.
+  if is_systemd_pid1; then
+    for unit in rabit-api.service rabit-web.service rabit-claude-worker.service; do
+      [[ -f "/etc/systemd/system/${unit}" ]] && systemctl start "$unit" 2>/dev/null || true
+    done
+  else
+    compose up -d api web 2>/dev/null || true
+  fi
 else
   log_warn "No Postgres dump in this backup — DB left untouched."
 fi

@@ -42,10 +42,14 @@ export type WsStatus = "idle" | "connecting" | "open" | "reconnecting" | "closed
 interface EventStoreState {
   wsStatus: WsStatus;
   lastSeq: number;
+  epoch: string | null;
   events: WireEvent[];
   coreState: CoreState;
   setWsStatus: (status: WsStatus) => void;
   pushEvent: (event: WireEvent) => void;
+  /** Apply the server's epoch from the hello frame; a change means the Redis
+   *  counter rewound, so the high-water mark must reset or the feed goes mute. */
+  applyEpoch: (epoch: string | null) => void;
   reset: () => void;
 }
 
@@ -54,6 +58,7 @@ const MAX_EVENTS = 200;
 export const useEventStore = create<EventStoreState>((set) => ({
   wsStatus: "idle",
   lastSeq: 0,
+  epoch: null,
   events: [],
   coreState: "connecting",
   setWsStatus: (status) =>
@@ -77,6 +82,11 @@ export const useEventStore = create<EventStoreState>((set) => ({
     })),
   pushEvent: (event) =>
     set((state) => {
+      // De-dup by event_id: replay + live (and any duplicate socket during a
+      // React StrictMode double-mount) can deliver the same event twice.
+      if (state.events.some((e) => e.event_id === event.event_id)) {
+        return state;
+      }
       const nextSeq = Math.max(state.lastSeq, event.sequence || 0);
       let coreState = state.coreState;
       if (event.type === "core.state.changed") {
@@ -88,5 +98,13 @@ export const useEventStore = create<EventStoreState>((set) => ({
       const events = [event, ...state.events].slice(0, MAX_EVENTS);
       return { events, lastSeq: nextSeq, coreState };
     }),
-  reset: () => set({ wsStatus: "idle", lastSeq: 0, events: [], coreState: "connecting" }),
+  applyEpoch: (epoch) =>
+    set((state) => {
+      if (epoch && state.epoch && epoch !== state.epoch) {
+        // Counter rewound: forget the high-water mark and the stale backlog.
+        return { epoch, lastSeq: 0, events: [] };
+      }
+      return { epoch: epoch ?? state.epoch };
+    }),
+  reset: () => set({ wsStatus: "idle", lastSeq: 0, epoch: null, events: [], coreState: "connecting" }),
 }));

@@ -285,6 +285,7 @@ sync_repo_to_app_root() {
     --exclude '.env' \
     --exclude 'backups' \
     --exclude 'node_modules' \
+    --exclude '.venv' \
     --exclude '__pycache__' \
     --exclude 'workspace' \
     "$REPO_ROOT"/ "$APP_ROOT"/
@@ -409,7 +410,11 @@ verify_claude_cli() {
   log_ok "Found claude CLI for ${AICOMPANY_USER}: ${claude_bin} (${version})"
 
   if sudo -u "$AICOMPANY_USER" -H bash -lc 'claude auth status' >/tmp/.claude_auth_status 2>&1; then
-    if grep -qi 'logged in\|authenticated' /tmp/.claude_auth_status 2>/dev/null; then
+    # The CLI reports auth as JSON: {"loggedIn": true, ...}. Match that first
+    # (the old 'logged in'/'authenticated' text never appears, so it always
+    # mis-reported an authenticated host as pending).
+    if grep -q '"loggedIn"[[:space:]]*:[[:space:]]*true' /tmp/.claude_auth_status 2>/dev/null \
+       || grep -qi 'logged in\|authenticated' /tmp/.claude_auth_status 2>/dev/null; then
       CLAUDE_LOGIN_PENDING=false
       log_ok "claude CLI reports an authenticated session for ${AICOMPANY_USER}"
     else
@@ -467,6 +472,12 @@ generate_env() {
           ;;
       esac
       echo "${key}=${value}" >> "$target"
+    elif [[ "$key" == "ENVIRONMENT" ]]; then
+      # .env.example ships ENVIRONMENT=development; a real install is
+      # production. This is what flips the session cookie to Secure (see
+      # config.cookie_secure) - leaving it 'development' ships the admin
+      # cookie without the Secure flag.
+      echo "ENVIRONMENT=production" >> "$target"
     else
       echo "$line" >> "$target"
     fi

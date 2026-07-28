@@ -41,6 +41,7 @@ export class RealtimeClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private lastFrameAt = 0;
+  private generation = 0;
 
   start() {
     this.closedByUser = false;
@@ -90,19 +91,30 @@ export class RealtimeClient {
       return;
     }
     this.socket = socket;
+    // Each socket gets a generation. A stale socket's late-firing handlers
+    // (e.g. a React StrictMode start->stop->start double-mount closes socket A
+    // while B connects) must not hijack B's state or spawn a third socket.
+    const gen = ++this.generation;
+    const isCurrent = () => this.generation === gen && this.socket === socket;
 
     socket.onopen = () => {
+      if (!isCurrent()) return;
       this.attempt = 0;
       useEventStore.getState().setWsStatus("open");
       this.startWatchdog();
     };
 
     socket.onmessage = (msg) => {
+      if (!isCurrent()) return;
       // Any frame - data OR heartbeat - proves the connection is alive.
       this.markFrame();
       try {
         const data = JSON.parse(msg.data);
-        if (data.type === "hello" || data.type === "heartbeat") return;
+        if (data.type === "hello") {
+          useEventStore.getState().applyEpoch(typeof data.epoch === "string" ? data.epoch : null);
+          return;
+        }
+        if (data.type === "heartbeat") return;
         if (typeof data.sequence === "number" && typeof data.type === "string") {
           useEventStore.getState().pushEvent(data as WireEvent);
         }
@@ -112,6 +124,7 @@ export class RealtimeClient {
     };
 
     socket.onclose = () => {
+      if (!isCurrent()) return; // a superseded socket closing is not our concern
       this.socket = null;
       this.clearWatchdog();
       if (this.closedByUser) {

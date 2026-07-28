@@ -74,26 +74,38 @@ async def websocket_endpoint(websocket: WebSocket, since_seq: int = 0):
     await websocket.accept()
     bus = EventBus(settings.redis_url)
 
-    await websocket.send_text(json.dumps({"type": "hello", "organization_id": organization_id}))
-
-    # Subscribe to the live channel BEFORE reading the replay slice. Otherwise
-    # an event published in the window between "read replay" and "subscribe"
-    # is in neither and is lost for the life of the connection. Subscribing
-    # first means such an event arrives on the live channel; we then de-dup by
-    # sequence against what replay already delivered.
-    pubsub = bus.pubsub(organization_id)
-
-    last_sent_seq = since_seq
-    for event in bus.replay_since(organization_id, since_seq):
-        await websocket.send_text(json.dumps(event))
-        seq = event.get("sequence")
-        if isinstance(seq, int) and seq > last_sent_seq:
-            last_sent_seq = seq
-
-    # A dedicated single-thread executor for the blocking pubsub poll, so this
-    # connection's poller can never occupy a slot in asyncio's shared default
-    # ThreadPoolExecutor (which DB work and every other run_in_executor needs).
+    # A dedicated single-thread executor for this connection's BLOCKING Redis
+    # calls, so nothing here (subscribe, replay LRANGE, epoch GET, the pubsub
+    # poll) ever runs synchronously on the event loop and freezes the whole
+    # single-process API, nor occupies asyncio's shared default executor.
     poll_executor = ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
+
+    async def run_blocking(fn, *args):
+        return await loop.run_in_executor(poll_executor, fn, *args)
+
+    try:
+        epoch = await run_blocking(bus.epoch, organization_id)
+        # hello carries the epoch: if it differs from what the client last saw,
+        # the client resets its high-water mark (its since_seq is meaningless
+        # after a Redis counter rewind).
+        await websocket.send_text(json.dumps({"type": "hello", "organization_id": organization_id, "epoch": epoch}))
+
+        # Subscribe to the live channel BEFORE reading the replay slice so an
+        # event published in that window is not lost (it arrives on the live
+        # channel; we de-dup against the replay slice's max sequence).
+        pubsub = await run_blocking(bus.pubsub, organization_id)
+
+        replay_max = since_seq
+        for event in await run_blocking(bus.replay_since, organization_id, since_seq):
+            await websocket.send_text(json.dumps(event))
+            seq = event.get("sequence")
+            if isinstance(seq, int) and seq > replay_max:
+                replay_max = seq
+    except Exception:  # noqa: BLE001 - Redis unreachable at connect: fail the socket cleanly
+        poll_executor.shutdown(wait=False)
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
 
     async def heartbeat_loop():
         while True:
@@ -101,10 +113,14 @@ async def websocket_endpoint(websocket: WebSocket, since_seq: int = 0):
             await websocket.send_text(json.dumps({"type": "heartbeat"}))
 
     async def forward_loop():
-        nonlocal last_sent_seq
-        loop = asyncio.get_event_loop()
+        # Live events are de-duped ONLY against the replay slice (replay_max),
+        # never against a running max - so a concurrently-published lower-seq
+        # event that arrives slightly out of order is still forwarded once
+        # (the client de-dups by event_id). A single Redis error must not
+        # silently kill this loop while heartbeats keep the socket "alive": on
+        # error we close the socket so the client reconnects and replays.
         while True:
-            message = await loop.run_in_executor(poll_executor, pubsub.get_message, True, 1.0)
+            message = await run_blocking(pubsub.get_message, True, 1.0)
             if not message or message.get("type") != "message":
                 continue
             data = message["data"]
@@ -112,24 +128,33 @@ async def websocket_endpoint(websocket: WebSocket, since_seq: int = 0):
                 seq = json.loads(data).get("sequence")
             except (ValueError, TypeError):
                 seq = None
-            # Skip anything already delivered in the replay slice above.
-            if isinstance(seq, int):
-                if seq <= last_sent_seq:
-                    continue
-                last_sent_seq = seq
+            if isinstance(seq, int) and seq <= replay_max:
+                continue  # already delivered in the replay slice
             await websocket.send_text(data)
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     forward_task = asyncio.create_task(forward_loop())
     try:
-        while True:
-            # Drain client->server frames (e.g. client-side acks); we don't
-            # require any, but must read to detect disconnects.
-            await websocket.receive_text()
+        # If the forwarder dies (e.g. Redis blip) close the socket rather than
+        # sitting on a dead feed behind live heartbeats. Wait on either the
+        # client's receive loop OR the forwarder ending.
+        async def receive_loop():
+            while True:
+                await websocket.receive_text()
+
+        receive_task = asyncio.create_task(receive_loop())
+        await asyncio.wait(
+            {receive_task, forward_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        receive_task.cancel()
     except WebSocketDisconnect:
         pass
     finally:
         heartbeat_task.cancel()
         forward_task.cancel()
-        pubsub.close()
+        try:
+            pubsub.close()
+        except Exception:  # noqa: BLE001
+            pass
         poll_executor.shutdown(wait=False)

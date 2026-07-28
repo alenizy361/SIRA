@@ -173,7 +173,9 @@ class ClaudeCodeAdapter:
             raise FileNotFoundError(f"Workspace repo does not exist: {candidate}")
         return candidate
 
-    def _create_worktree(self, repo_path: Path, task_id: str, branch_name: str | None) -> tuple[Path, str]:
+    def _create_worktree(
+        self, repo_path: Path, task_id: str, branch_name: str | None, run_id: str | None = None
+    ) -> tuple[Path, str]:
         # task_id can originate from a Task row created via the API - it must
         # be treated as untrusted input here. A task_id containing path
         # separators (e.g. "../../../../tmp/pwned") would otherwise let the
@@ -182,8 +184,13 @@ class ClaudeCodeAdapter:
         # how many separators arrived in one string. Reject anything that
         # isn't a safe single path-component slug.
         safe_task_id = _safe_path_component(task_id)
-        branch = branch_name or f"agent/task-{safe_task_id}"
-        worktree_dir = repo_path.parent / ".worktrees" / f"{repo_path.name}-{safe_task_id}"
+        # Make the worktree dir AND branch unique per RUN (attempt). Without
+        # this, a retry of the same task_id collides with the first attempt's
+        # leftover dir/branch and `git worktree add` fails deterministically -
+        # every repo-task retry then fails instantly without invoking the CLI.
+        suffix = _safe_path_component(run_id) if run_id else safe_task_id
+        branch = branch_name or f"agent/task-{safe_task_id}-{suffix[:12]}"
+        worktree_dir = repo_path.parent / ".worktrees" / f"{repo_path.name}-{safe_task_id}-{suffix[:12]}"
         worktree_dir.parent.mkdir(parents=True, exist_ok=True)
 
         resolved = worktree_dir.resolve()
@@ -191,8 +198,16 @@ class ClaudeCodeAdapter:
         if expected_parent not in resolved.parents:
             raise WorkspaceEscapeError(f"Computed worktree path '{resolved}' escapes '.worktrees'")
 
+        # Belt-and-suspenders: clear any stale worktree/branch at these exact
+        # names (e.g. from a crash between add and cleanup) so `add` is always
+        # a clean start.
         subprocess.run(
-            ["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree_dir), "HEAD"],
+            ["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree_dir)],
+            capture_output=True, text=True,
+        )
+        subprocess.run(["git", "-C", str(repo_path), "worktree", "prune"], capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo_path), "worktree", "add", "-B", branch, str(worktree_dir), "HEAD"],
             check=True,
             capture_output=True,
             text=True,
@@ -240,7 +255,7 @@ class ClaudeCodeAdapter:
                 ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
                 capture_output=True, text=True, check=True,
             ).stdout.strip()
-            worktree_dir, branch_name = self._create_worktree(repo_path, task.task_id, task.branch_name)
+            worktree_dir, branch_name = self._create_worktree(repo_path, task.task_id, task.branch_name, run_id)
         else:
             baseline_commit = None
             worktree_dir = self.workspace_root
@@ -284,6 +299,7 @@ class ClaudeCodeAdapter:
             text=True,
             bufsize=1,
             preexec_fn=_apply_resource_limits,
+            env=_sanitized_env(),
         )
         handle = RunHandle(process)
         started_at = time.time()
@@ -443,8 +459,8 @@ def _parse_stream_line(line: str) -> list[dict]:
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
-        # Text-fallback mode: treat the raw line as plain progress text.
-        return [{"kind": "text_fallback", "text": line}]
+        # Text-fallback mode: treat the raw line as plain progress text (scrubbed).
+        return [{"kind": "text_fallback", "text": _scrub_secrets(line)}]
 
     msg_type = obj.get("type")
     events: list[dict] = []
@@ -459,7 +475,9 @@ def _parse_stream_line(line: str) -> list[dict]:
             if btype == "tool_use":
                 events.append({"kind": "tool_call", "tool_name": block.get("name"), "input": _redact(block.get("input", {}))})
             elif btype == "text":
-                events.append({"kind": "final_text", "text": block.get("text", "")})
+                # The model's own prose is also untrusted - it can echo a
+                # secret it just read (e.g. summarizing a .env). Scrub it too.
+                events.append({"kind": "final_text", "text": _scrub_secrets(block.get("text", ""))})
         return events
     if msg_type == "user":
         # Tool RESULTS arrive as a "user"-role message in the stream-json
@@ -482,7 +500,9 @@ def _parse_stream_line(line: str) -> list[dict]:
                 })
         return events
     if msg_type == "result":
-        return [{"kind": "final_text", "text": obj.get("result", "")}]
+        return [{"kind": "final_text", "text": _scrub_secrets(obj.get("result", ""))}]
+    if msg_type is None:
+        return [{"kind": "other"}]
     return [{"kind": "other", "raw_type": msg_type}]
 
 
@@ -498,8 +518,35 @@ _SECRET_VALUE_PATTERNS = [
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),                         # GitHub tokens
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),                       # Slack tokens
     re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s\"']*:[^\s\"'@/]+@"),  # creds in a URL
-    re.compile(r"(?i)(password|secret|api[_-]?key|token|credential)\s*[=:]\s*\S+"),  # KEY=VALUE / KEY: VALUE
+    re.compile(r"(?i)(password|secret|api[_-]?key|token|credential|dsn)\s*[=:]\s*\S+"),  # KEY=VALUE / KEY: VALUE
+    # PEM private-key blocks (SSH/TLS deploy keys read during debugging).
+    re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]+?-----END[A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----"),  # header alone (truncated body)
 ]
+
+# Platform secrets the worker holds in its own environment (systemd
+# EnvironmentFile=.env). The child `claude` process has no legitimate need
+# for them, and inheriting them means an agent that runs `env`/`printenv`
+# could echo them into its output. Strip them from the child's environment.
+_SENSITIVE_ENV_KEYS = {
+    "DATABASE_URL", "POSTGRES_PASSWORD", "POSTGRES_USER", "SESSION_SECRET_KEY",
+    "REDIS_URL", "REDIS_PASSWORD", "RABIT_API_URL",
+}
+_SENSITIVE_ENV_HINT = re.compile(r"(password|secret|token|api[_-]?key|credential|dsn)", re.IGNORECASE)
+
+
+def _sanitized_env() -> dict:
+    """A copy of the current environment with platform secrets removed, for
+    the child `claude` process (which never needs them). CLAUDE_* is preserved
+    - it can carry the CLI's own auth/session, which we must not strip."""
+    def keep(k: str) -> bool:
+        if k.startswith("CLAUDE"):
+            return True
+        if k in _SENSITIVE_ENV_KEYS:
+            return False
+        return not _SENSITIVE_ENV_HINT.search(k)
+
+    return {k: v for k, v in os.environ.items() if keep(k)}
 
 
 def _scrub_secrets(text):

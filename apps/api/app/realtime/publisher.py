@@ -5,9 +5,12 @@ this monorepo - see worker.py) so both sides of "the dashboard reacts to
 real backend activity" go through one sequence-numbered, Redis-backed path
 instead of hand-rolling Event construction in three different places.
 """
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("rabit.publisher")
 
 # parents[4] is the repo root: this file is apps/api/app/realtime/publisher.py,
 # so [0]=realtime [1]=app [2]=api [3]=apps [4]=<repo root>. An earlier
@@ -42,19 +45,29 @@ def publish(
     entities: Optional[list[EntityRef]] = None,
 ) -> None:
     """organization_id may be a str or uuid.UUID - always stringified before
-    it reaches the wire/Redis key so callers don't need to care."""
-    bus = get_bus()
-    org_id_str = str(organization_id)
-    event = Event(
-        sequence=bus.next_sequence(org_id_str),
-        type=event_type,
-        organization_id=org_id_str,
-        correlation_id=correlation_id,
-        actor=actor,
-        entities=entities or [],
-        payload=payload or {},
-    )
-    bus.publish(event)
+    it reaches the wire/Redis key so callers don't need to care.
+
+    Publishing is ADVISORY: the dashboard reacting is nice-to-have, never a
+    correctness requirement. A Redis outage must NOT roll back a committed run,
+    500 a create endpoint after the row is durable, or abort a worker tick - so
+    every failure here is logged and swallowed. Callers commit their DB work
+    FIRST, then publish. A consumed-but-unused sequence number just leaves a
+    harmless gap (replay tolerates gaps)."""
+    try:
+        bus = get_bus()
+        org_id_str = str(organization_id)
+        event = Event(
+            sequence=bus.next_sequence(org_id_str),
+            type=event_type,
+            organization_id=org_id_str,
+            correlation_id=correlation_id,
+            actor=actor,
+            entities=entities or [],
+            payload=payload or {},
+        )
+        bus.publish(event)
+    except Exception:  # noqa: BLE001 - events are advisory, never fatal
+        logger.warning("event publish failed (%s) - continuing", event_type, exc_info=True)
 
 
 def publish_core_state(organization_id, state: CoreState, actor: str, correlation_id: str) -> None:

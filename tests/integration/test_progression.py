@@ -92,6 +92,97 @@ def test_dependent_is_cancelled_when_prerequisite_is_dead(db, org_id):
     assert dependent.state == "cancelled"
 
 
+def test_cancelling_a_goal_cancels_its_tasks_and_drops_leases(db, org_id):
+    """Regression: cancelling a goal must stop its work - every non-terminal
+    task -> CANCELLED and its lease removed, so the worker stops leasing them."""
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    api_root = Path(__file__).resolve().parents[2] / "apps" / "api"
+    if str(api_root) not in sys.path:
+        sys.path.insert(0, str(api_root))
+    from app.models.company import Goal
+    from app.models.work import Plan, Run, RunLease, Task
+    from app.routers.goals import _cancel_goal_tasks
+
+    goal = Goal(organization_id=org_id, created_by=None, title="G", description="d",
+                source="user", priority=3, state="goal_captured", acceptance_criteria={}, metadata_json={})
+    db.add(goal)
+    db.commit()
+    db.refresh(goal)
+    plan = Plan(organization_id=org_id, created_by=None, goal_id=goal.id, title="P", state="drafted")
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    task = Task(organization_id=org_id, plan_id=plan.id, title="T", description="d",
+                assigned_agent_key="frontend_engineer", state="ready",
+                idempotency_key=f"task-{uuid.uuid4()}", acceptance_criteria={})
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    run = Run(organization_id=org_id, task_id=task.id, agent_key="frontend_engineer")
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    db.add(RunLease(task_id=task.id, run_id=run.id, worker_id="w",
+                    acquired_at=datetime.now(timezone.utc),
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+                    heartbeat_at=datetime.now(timezone.utc)))
+    db.commit()
+
+    n = _cancel_goal_tasks(db, goal)
+    db.commit()
+    assert n == 1
+    db.refresh(task)
+    assert task.state == "cancelled"
+    assert db.query(RunLease).filter(RunLease.task_id == task.id).count() == 0
+    # (the org_id fixture teardown deletes tasks then plans then goals in FK order)
+
+
+def test_orphaned_running_task_with_no_live_lease_is_requeued(db, org_id):
+    """A worker killed mid-run leaves its task RUNNING with its lease expired.
+    The reaper must requeue it (RETRY_WAIT) so it isn't stranded forever."""
+    task = _make_task(db, org_id, state="running")
+    # No live lease exists for it (simulating a dead worker whose lease expired).
+    changed = advance_ready_pipeline(db, org_id)
+    assert changed >= 1
+    db.refresh(task)
+    assert task.state == "retry_wait"
+
+
+def test_running_task_with_a_live_lease_is_left_alone(db, org_id):
+    """A healthy in-flight run still holds an unexpired lease - the reaper must
+    NOT touch it."""
+    from datetime import datetime, timedelta, timezone
+    from app.models.work import Run, RunLease
+
+    task = _make_task(db, org_id, state="running")
+    run = Run(organization_id=org_id, task_id=task.id, agent_key="frontend_engineer")
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    db.add(RunLease(
+        task_id=task.id, run_id=run.id, worker_id="worker-A",
+        acquired_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        heartbeat_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    advance_ready_pipeline(db, org_id)
+    db.refresh(task)
+    assert task.state == "running"  # untouched - it's alive
+
+
+def test_assigned_orphan_is_requeued(db, org_id):
+    """ASSIGNED (not yet RUNNING) with no live lease must also be recoverable."""
+    task = _make_task(db, org_id, state="assigned")
+    advance_ready_pipeline(db, org_id)
+    db.refresh(task)
+    assert task.state == "retry_wait"
+
+
 def test_dependent_stays_ready_while_prerequisite_still_running(db, org_id):
     from app.models.work import TaskDependency
 

@@ -44,6 +44,27 @@ def test_workspace_escape_rejected(tmp_path):
         adapter._resolve_workspace_repo("../../etc")
 
 
+def test_worktree_retry_uses_a_unique_dir_and_branch(tmp_path):
+    """Regression: a retry of the same task must NOT collide with the first
+    attempt's worktree dir/branch. Two _create_worktree calls with different
+    run_ids for the same task both succeed and produce distinct dir+branch."""
+    import subprocess
+
+    root = tmp_path / "workspace"
+    repo = root / "sample-repo"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "--allow-empty", "-q", "-m", "init"], check=True)
+
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root=root)
+    d1, b1 = adapter._create_worktree(repo, "task-xyz", None, run_id="run-aaaa1111")
+    d2, b2 = adapter._create_worktree(repo, "task-xyz", None, run_id="run-bbbb2222")
+
+    assert d1 != d2 and b1 != b2
+    assert d1.exists() and d2.exists()  # both attempts have a real checkout
+
+
 def test_workspace_within_root_accepted(tmp_path):
     root = tmp_path / "workspace"
     repo = root / "sample-repo"

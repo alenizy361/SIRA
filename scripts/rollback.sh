@@ -78,13 +78,41 @@ else
   log_warn "No Postgres dump in this backup — skipping DB restore (code/config-only rollback)."
 fi
 
-log_step "3/5 — Restoring git ref"
-if [[ -n "${TARGET_SHA:-}" && "$TARGET_SHA" != "unknown" ]] && git -C "$APP_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git -C "$APP_ROOT" checkout "$TARGET_SHA" || die "git checkout ${TARGET_SHA} failed."
-  log_ok "Checked out ${TARGET_SHA}"
+log_step "3/5 — Restoring code to ${TARGET_SHA:-<unknown>}"
+# APP_ROOT is produced by install.sh's rsync (no .git), so revert via the real
+# source clone: RABIT_CLONE or BUILD_INFO's source= path. Check out the target
+# commit there, then rsync into APP_ROOT so the rebuilt images run the OLD code
+# to match the restored OLD database.
+_CLONE=""
+if git -C "$APP_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  _CLONE="$APP_ROOT"
 else
-  log_warn "No usable git commit recorded in this backup (or ${APP_ROOT} is not a git checkout) — leaving git ref untouched."
+  _CLONE="${RABIT_CLONE:-}"
+  [[ -z "$_CLONE" && -f "$APP_ROOT/BUILD_INFO" ]] && _CLONE="$(sed -n 's/^source=//p' "$APP_ROOT/BUILD_INFO" | head -1)"
 fi
+CODE_REVERTED=false
+if [[ -n "${TARGET_SHA:-}" && "$TARGET_SHA" != "unknown" && -n "$_CLONE" && -d "$_CLONE/.git" ]]; then
+  if git -C "$_CLONE" checkout "$TARGET_SHA" 2>/dev/null; then
+    if [[ "$_CLONE" != "$APP_ROOT" ]]; then
+      rsync -a --delete \
+        --exclude '.git' --exclude '.env' --exclude 'backups' \
+        --exclude 'node_modules' --exclude '.venv' --exclude '__pycache__' --exclude 'workspace' \
+        "$_CLONE"/ "$APP_ROOT"/
+    fi
+    CODE_REVERTED=true
+    log_ok "Code reverted to ${TARGET_SHA} (source clone: ${_CLONE})"
+  else
+    log_warn "Could not checkout ${TARGET_SHA} in ${_CLONE}."
+  fi
+fi
+if [[ "$CODE_REVERTED" != "true" ]]; then
+  log_warn "CODE WAS NOT REVERTED (no usable git clone / commit). The database was rolled back but the app code is unchanged - they may mismatch. To revert the code, run scripts/redeploy.sh with the target commit checked out in your clone."
+fi
+
+log_step "3b/5 — Rebuilding images from the restored code"
+# Without this the containers keep the previously-built (new-code) image even
+# after the code and DB were reverted.
+compose build api web || log_warn "image rebuild failed — containers may still run the previous image."
 
 if [[ -f "$BACKUP_DIR/.env" ]]; then
   cp -p "$APP_ROOT/.env" "$APP_ROOT/.env.pre-rollback.bak" 2>/dev/null || true
@@ -94,13 +122,14 @@ if [[ -f "$BACKUP_DIR/.env" ]]; then
 fi
 
 log_step "4/5 — Restarting services"
+# Force-recreate so the freshly (re)built image actually replaces the running
+# container rather than the old one being restarted in place.
+compose up -d --force-recreate postgres redis api web || log_warn "compose recreate reported an error."
 if is_systemd_pid1; then
   systemctl daemon-reload
   for unit in rabit-api.service rabit-web.service rabit-claude-worker.service; do
-    [[ -f "/etc/systemd/system/${unit}" ]] && systemctl start "$unit" 2>/dev/null || true
+    [[ -f "/etc/systemd/system/${unit}" ]] && systemctl restart "$unit" 2>/dev/null || true
   done
-else
-  compose up -d postgres redis api web
 fi
 
 log_step "5/5 — Smoke testing rolled-back stack"

@@ -11,7 +11,13 @@ _SERVICES_ROOT = Path(__file__).resolve().parents[4] / "services"
 if str(_SERVICES_ROOT) not in sys.path:
     sys.path.insert(0, str(_SERVICES_ROOT))
 
-from orchestrator.state_machine import GoalState, InvalidTransition, transition_goal  # noqa: E402
+from orchestrator.state_machine import (  # noqa: E402
+    GoalState,
+    InvalidTransition,
+    TaskState,
+    transition_goal,
+    transition_task,
+)
 
 from app.auth.dependencies import get_current_user
 from app.db import get_db
@@ -105,9 +111,48 @@ def transition(
 
     goal.state = new_state.value
     db.add(goal)
+
+    cancelled_tasks = 0
+    if new_state == GoalState.CANCELLED:
+        cancelled_tasks = _cancel_goal_tasks(db, goal)
+
     db.commit()
-    _audit(db, user, "goal.transition", str(goal.id), "executed", f"-> {new_state.value}")
+    explanation = f"-> {new_state.value}"
+    if cancelled_tasks:
+        explanation += f" ({cancelled_tasks} task(s) cancelled)"
+    _audit(db, user, "goal.transition", str(goal.id), "executed", explanation)
     return _goal_out(goal)
+
+
+def _cancel_goal_tasks(db: DbSession, goal: Goal) -> int:
+    """Cancelling a goal must stop its work: transition every non-terminal task
+    of the goal's plans to CANCELLED and delete their leases, so the worker
+    stops leasing them and no new claude runs are launched (and money spent)
+    after the goal is cancelled."""
+    from app.models.work import Plan, RunLease, Task
+
+    _TERMINAL = {
+        TaskState.COMPLETED.value, TaskState.CANCELLED.value,
+        TaskState.FAILED.value, TaskState.INCIDENT_OPENED.value,
+    }
+    plan_ids = [row[0] for row in db.query(Plan.id).filter(Plan.goal_id == goal.id).all()]
+    if not plan_ids:
+        return 0
+    tasks = db.query(Task).filter(Task.plan_id.in_(plan_ids)).all()
+    count = 0
+    for task in tasks:
+        if task.state in _TERMINAL:
+            continue
+        try:
+            task.state = transition_task(TaskState(task.state), TaskState.CANCELLED).value
+        except InvalidTransition:
+            # Force the terminal state even from an unusual state - a cancelled
+            # goal must never leave a runnable task behind.
+            task.state = TaskState.CANCELLED.value
+        db.add(task)
+        db.query(RunLease).filter(RunLease.task_id == task.id).delete(synchronize_session=False)
+        count += 1
+    return count
 
 
 @router.post("/{goal_id}/plan", status_code=status.HTTP_202_ACCEPTED)

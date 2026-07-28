@@ -79,20 +79,30 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
     # schedulable again instead of being stuck forever behind a dead lease
     # (constitution section 6 restart-recovery). Cheap and global; runs once.
     expire_stale_leases(db)
+
+    # One auth probe per tick. If the CLI session has lapsed, DON'T touch the
+    # CLI at all: leave requested goals 'requested' and ready tasks READY so
+    # they resume the moment an operator re-authenticates - never burn retries
+    # or strand work during a login outage.
+    authed = True
+    try:
+        adapter.check_auth()
+    except AuthenticationRequiredError:
+        authed = False
+        logger.warning("Claude CLI not authenticated - skipping CLI work this tick; queued work is preserved.")
+
     for org_id, autonomy_mode in db.query(Organization.id, Organization.autonomy_mode).all():
         if autonomy_mode not in AUTONOMOUS_EXECUTION_MODES:
             continue
-        # 1. Goals whose owner asked the CEO agent to plan them. This runs on
-        #    the host (not the API container) precisely because it needs the
-        #    `claude` CLI's authenticated session - see request_plan() in
-        #    apps/api/app/routers/goals.py.
-        executed += _run_pending_plans(db, org_id)
-        # 2. Move stranded tasks forward: retry-backoff RETRY_WAIT->READY and
-        #    cancel dependents of a dead prerequisite. Without this a single
-        #    transient failure parks a task in RETRY_WAIT permanently. Not
-        #    counted as "executed" - it triggers no CLI invocation itself.
+        # DB-only progression always runs (no CLI): requeue orphaned tasks from
+        # a dead worker, run retry backoff, cancel dead-dependency branches.
         advance_ready_pipeline(db, org_id)
-        # 3. Tasks a plan produced, ready for an engineer/analyst agent to run.
+        if not authed:
+            continue
+        # 1. Goals whose owner asked the CEO agent to plan them (needs the
+        #    host CLI session - see request_plan() in routers/goals.py).
+        executed += _run_pending_plans(db, org_id)
+        # 2. Tasks a plan produced, ready for an engineer/analyst agent to run.
         ready = pick_ready_tasks(db, org_id, agent_concurrency_limits)
         for task in ready:
             executed += _execute_task(db, adapter, task)
@@ -106,12 +116,41 @@ def _run_pending_plans(db, org_id) -> int:
     from app.services.planning import PlanningError, plan_goal
     from contracts.events import EntityRef, EventType
 
+    from datetime import datetime, timezone
+
     ran = 0
     goals = (
         db.query(Goal)
         .filter(Goal.organization_id == org_id, Goal.state == "goal_captured")
         .all()
     )
+    # Reset DEAD planning claims first: a goal stamped plan_status='running'
+    # whose worker died mid-plan (or whose PLANNING publish raised) is never
+    # re-selected and shows the CEO "planning" forever. A running claim older
+    # than the planning timeout is dead - hand it back to 'requested'.
+    now = datetime.now(timezone.utc)
+    STALE_PLAN_SECONDS = 600  # >> planning timeout (180s)
+    for goal in goals:
+        meta = dict(goal.metadata_json or {})
+        if meta.get("plan_status") != "running":
+            continue
+        claimed = meta.get("plan_claimed_at")
+        stale = True
+        if claimed:
+            try:
+                started = datetime.fromisoformat(claimed)
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                stale = (now - started).total_seconds() > STALE_PLAN_SECONDS
+            except ValueError:
+                stale = True
+        if stale:
+            logger.warning("Resetting dead planning claim on goal %s -> requested", goal.id)
+            meta["plan_status"] = "requested"
+            goal.metadata_json = meta
+            db.add(goal)
+            db.commit()
+
     for goal in goals:
         meta = dict(goal.metadata_json or {})
         if meta.get("plan_status") != "requested":
@@ -127,6 +166,7 @@ def _run_pending_plans(db, org_id) -> int:
             db.commit()  # release the row lock; someone else claimed it
             continue
         locked_meta["plan_status"] = "running"
+        locked_meta["plan_claimed_at"] = now.isoformat()
         locked.metadata_json = locked_meta
         db.add(locked)
         db.commit()  # commit releases the lock and publishes the claim
@@ -228,12 +268,26 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         db.commit()
         return 0
 
-    task.state = transition_task(TaskState(task.state), TaskState.ASSIGNED).value
-    db.add(task)
-    db.commit()
-    publish(org_id, EventType.TASK_ASSIGNED, actor, str(task.id), payload={"title": task.title}, entities=_task_entities(task, run))
-
     try:
+        # The READY->ASSIGNED step is INSIDE the try/finally now so a failure
+        # here (e.g. a Redis publish blip, or a stale pick where another worker
+        # already advanced this task past READY) still releases the lease and
+        # lands the task in a recoverable state rather than wedging it.
+        try:
+            task.state = transition_task(TaskState(task.state), TaskState.ASSIGNED).value
+        except InvalidTransition:
+            # Stale snapshot: this task is no longer READY (another worker took
+            # it). Drop our orphan Run + lease and move on.
+            logger.info("Task %s no longer READY at assign time - skipping (stale pick)", task.id)
+            db.rollback()
+            db.delete(run)
+            db.commit()
+            release_lease(db, task.id, worker_id=WORKER_ID)
+            return 0
+        db.add(task)
+        db.commit()
+        publish(org_id, EventType.TASK_ASSIGNED, actor, str(task.id), payload={"title": task.title}, entities=_task_entities(task, run))
+
         task.state = transition_task(TaskState(task.state), TaskState.RUNNING).value
         run.state = "running"
         db.add(task)
@@ -272,17 +326,19 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         publish_core_state(org_id, CoreState.IDLE, actor, str(task.id))
         return 1
     except AuthenticationRequiredError:
-        logger.error("Claude CLI not authenticated - pausing this task, will retry once an operator logs in.")
+        # Land in RETRY_WAIT (not BLOCKED): BLOCKED has no automatic path back
+        # to READY, so an auth blip during a run would strand the task forever.
+        # RETRY_WAIT is picked up by the backoff driver once the operator
+        # re-authenticates. (run_once's per-tick auth gate normally prevents
+        # ever reaching here, so retries are rarely burned.)
+        logger.error("Claude CLI not authenticated mid-run - requeuing task for retry after login.")
         db.rollback()
-        db.refresh(task)
-        task.state = transition_task(TaskState(task.state), TaskState.BLOCKED).value
-        db.add(task)
-        db.commit()
+        try:
+            db.refresh(task)
+        except Exception:  # noqa: BLE001
+            pass
+        _mark_task_recoverable(db, task, run, org_id, actor)
         publish_core_state(org_id, CoreState.PAUSED, actor, str(task.id))
-        publish(
-            org_id, EventType.TASK_BLOCKED, actor, str(task.id),
-            payload={"reason": "claude_cli_not_authenticated"}, entities=_task_entities(task, run),
-        )
         return 0
     except Exception:  # noqa: BLE001 - never leave a task stuck in RUNNING
         # A missing CLI, a subprocess timeout, a worktree collision, a Redis

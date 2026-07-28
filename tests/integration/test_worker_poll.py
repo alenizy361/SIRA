@@ -59,6 +59,7 @@ def test_poll_tick_is_a_noop_when_no_ready_tasks(db, org_id, monkeypatch):
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
     adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
 
     executed = run_once(db, adapter, agent_concurrency_limits={})
@@ -70,6 +71,7 @@ def test_poll_tick_executes_ready_task_and_advances_state(db, org_id, monkeypatc
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
     adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
 
     task = _make_ready_task(db, org_id)
@@ -91,6 +93,7 @@ def test_unexpected_run_error_lands_task_in_retry_wait_not_stuck_running(db, org
         raise FileNotFoundError("claude CLI not found on host")
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _boom_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
     adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
 
     task = _make_ready_task(db, org_id)
@@ -107,6 +110,7 @@ def test_poll_tick_skips_task_over_concurrency_ceiling(db, org_id, monkeypatch):
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
     adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
 
     _make_ready_task(db, org_id)
@@ -123,6 +127,7 @@ def test_emergency_stop_autonomy_mode_blocks_new_task_assignment(db, org_id, mon
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
     adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
 
     org = db.get(Organization, org_id)

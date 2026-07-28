@@ -22,7 +22,7 @@ _API_ROOT = Path(__file__).resolve().parents[2] / "apps" / "api"
 if str(_API_ROOT) not in sys.path:
     sys.path.insert(0, str(_API_ROOT))
 
-from app.models.work import RetryRecord, Task, TaskDependency  # noqa: E402
+from app.models.work import RetryRecord, Run, RunLease, Task, TaskDependency  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from .retry import compute_backoff_seconds  # noqa: E402
@@ -63,10 +63,45 @@ def advance_ready_pipeline(db: Session, organization_id: uuid.UUID) -> int:
     now = datetime.now(timezone.utc)
     changed = 0
 
+    # 0. Reclaim ORPHANED tasks: a worker that died/was-restarted mid-run
+    #    (systemctl restart on deploy, OOM, host reboot) leaves its task
+    #    committed as ASSIGNED/RUNNING while its lease is deleted by
+    #    expire_stale_leases - and nothing else ever moves it. Requeue any
+    #    ASSIGNED/RUNNING task that has no LIVE lease so the retry path below
+    #    picks it up. (A task being actively worked still holds an unexpired
+    #    lease, so this never touches a healthy run.)
+    live_lease_task_ids = {
+        row[0] for row in db.query(RunLease.task_id).filter(RunLease.expires_at > now).all()
+    }
+    orphaned = (
+        db.query(Task)
+        .filter(
+            Task.organization_id == organization_id,
+            Task.state.in_([TaskState.ASSIGNED.value, TaskState.RUNNING.value]),
+        )
+        .all()
+    )
+    for task in orphaned:
+        if task.id in live_lease_task_ids:
+            continue
+        try:
+            task.state = transition_task(TaskState(task.state), TaskState.RETRY_WAIT).value
+        except InvalidTransition:
+            continue
+        # Mark the abandoned run failed so it isn't left dangling "running".
+        for run in db.query(Run).filter(Run.task_id == task.id, Run.state == "running").all():
+            run.state = "failed"
+            db.add(run)
+        db.add(task)
+        changed += 1
+
     # 1. Retry backoff: RETRY_WAIT -> READY (cooled down, retries left) / FAILED.
+    #    Lock the rows (skip if another worker holds them) so two ticks never
+    #    both write a RetryRecord for the same attempt and inflate the count.
     retry_tasks = (
         db.query(Task)
         .filter(Task.organization_id == organization_id, Task.state == TaskState.RETRY_WAIT.value)
+        .with_for_update(skip_locked=True)
         .all()
     )
     for task in retry_tasks:

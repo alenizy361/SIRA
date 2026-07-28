@@ -158,7 +158,10 @@ check_claude_as() {
     auth_output="$(sudo -u "$run_as" -H bash -lc 'claude auth status' 2>&1)"; rc=$?
   fi
 
-  if [[ $rc -eq 0 ]] && echo "$auth_output" | grep -qi 'logged in\|authenticated'; then
+  # `claude auth status` emits JSON ({"loggedIn": true, ...}); match that first
+  # so an authenticated host is not perpetually reported UNHEALTHY.
+  if [[ $rc -eq 0 ]] && { echo "$auth_output" | grep -q '"loggedIn"[[:space:]]*:[[:space:]]*true' \
+       || echo "$auth_output" | grep -qi 'logged in\|authenticated'; }; then
     result PASS "claude auth status (as ${run_as})" "authenticated"
   else
     result FAIL "claude auth status (as ${run_as})" "not authenticated (or unsupported CLI subcommand)" "sudo -u ${run_as} -H claude auth login"

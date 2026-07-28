@@ -134,6 +134,13 @@ load_env_file() {
     value="${value%\"}"; value="${value#\"}"
     value="${value%\'}"; value="${value#\'}"
     [[ -z "$key" ]] && continue
+    # Do NOT clobber a value the caller already set in the environment. The
+    # installer's usage is `sudo DOMAIN=example.com scripts/install.sh`, but
+    # the generated .env has an empty `DOMAIN=`; without this guard load_env_file
+    # would export DOMAIN="" over the operator's value and silently skip TLS.
+    if [[ -n "${!key:-}" ]]; then
+      continue
+    fi
     export "${key}=${value}"
   done < "$file"
 }

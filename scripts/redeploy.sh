@@ -53,7 +53,18 @@ port_conflict() {
   docker ps --format '{{.Ports}}' 2>/dev/null | grep -q "127\.0\.0\.1:${port}->" && return 1
   return 0
 }
-for p in 5432 6379; do
+# Honor the POSTGRES_PORT/REDIS_PORT overrides this script itself tells the
+# operator to set in .env - otherwise, after they re-port the stack, the next
+# run would keep probing 5432/6379 and abort forever on the unrelated service.
+_env_port() {
+  local key="$1" default="$2"
+  local v=""
+  [[ -f "$APP_ROOT/.env" ]] && v="$(sed -n "s/^${key}=//p" "$APP_ROOT/.env" | head -1)"
+  echo "${v:-$default}"
+}
+PG_PORT="$(_env_port POSTGRES_PORT 5432)"
+RD_PORT="$(_env_port REDIS_PORT 6379)"
+for p in "$PG_PORT" "$RD_PORT"; do
   if port_conflict "$p"; then
     warn "Something that is not Docker is already listening on port ${p}."
     warn "docker compose publishes Postgres/Redis on 127.0.0.1:${p} so the host"

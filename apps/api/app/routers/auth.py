@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session as DbSession
 
 from app.auth.dependencies import get_current_user
@@ -22,10 +22,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class OnboardRequest(BaseModel):
-    organization_name: str
+    # Bounded to the DB column widths (String(200)) so an over-long value is a
+    # clean 422, never a mid-transaction StringDataRightTruncation that could
+    # brick bootstrap after the org row is already durable.
+    organization_name: str = Field(min_length=1, max_length=200)
     admin_email: EmailStr
     admin_password: str
-    admin_display_name: str
+    admin_display_name: str = Field(min_length=1, max_length=200)
 
 
 class LoginRequest(BaseModel):
@@ -45,14 +48,16 @@ def onboard(payload: OnboardRequest, response: Response, request: Request, db: D
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 12 characters")
 
     settings = get_settings()
+    # Org + admin in ONE transaction: a failure creating the user must not
+    # leave a durable org with zero users (which the guard above would then
+    # treat as "onboarding done" forever, bricking bootstrap).
     org = Organization(
         name=payload.organization_name,
         default_currency=settings.organization_default_currency,
         default_timezone=settings.organization_default_timezone,
     )
     db.add(org)
-    db.commit()
-    db.refresh(org)
+    db.flush()  # assign org.id without committing
 
     user = User(
         organization_id=org.id,
@@ -62,6 +67,7 @@ def onboard(payload: OnboardRequest, response: Response, request: Request, db: D
     )
     db.add(user)
     db.commit()
+    db.refresh(org)
     db.refresh(user)
 
     cookie_value, _ = create_session(user, db, request.client.host if request.client else None, request.headers.get("user-agent"))
@@ -69,7 +75,7 @@ def onboard(payload: OnboardRequest, response: Response, request: Request, db: D
         settings.session_cookie_name,
         cookie_value,
         httponly=True,
-        secure=settings.environment != "development",
+        secure=settings.cookie_secure,
         samesite="lax",
         max_age=settings.session_ttl_seconds,
     )
@@ -78,7 +84,15 @@ def onboard(payload: OnboardRequest, response: Response, request: Request, db: D
 
 @router.post("/login")
 def login(payload: LoginRequest, response: Response, request: Request, db: DbSession = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).one_or_none()
+    # Deterministic under any duplicate email (e.g. a bootstrap-race that
+    # created two orgs): pick the earliest rather than raising
+    # MultipleResultsFound, which would 500 every login permanently.
+    user = (
+        db.query(User)
+        .filter(User.email == payload.email)
+        .order_by(User.created_at.asc())
+        .first()
+    )
     generic_error = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     if user is None:
@@ -96,7 +110,7 @@ def login(payload: LoginRequest, response: Response, request: Request, db: DbSes
         settings.session_cookie_name,
         cookie_value,
         httponly=True,
-        secure=settings.environment != "development",
+        secure=settings.cookie_secure,
         samesite="lax",
         max_age=settings.session_ttl_seconds,
     )

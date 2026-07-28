@@ -7,6 +7,7 @@ replay after reconnect, and a payload shape that can never leak secrets
 """
 import json
 import sys
+import uuid
 from pathlib import Path
 
 import redis
@@ -25,7 +26,16 @@ REPLAY_LOG_MAX_LEN = 2000
 
 class EventBus:
     def __init__(self, redis_url: str) -> None:
-        self._redis = redis.from_url(redis_url, decode_responses=True)
+        # Bounded timeouts so a STALLED Redis (as opposed to one refusing
+        # connections) can never block a caller forever - critical on the async
+        # /ws path where a blocked call would freeze the whole event loop.
+        self._redis = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            health_check_interval=30,
+        )
 
     def _channel(self, organization_id: str) -> str:
         return f"rabit:events:{organization_id}"
@@ -36,11 +46,38 @@ class EventBus:
     def _replay_key(self, organization_id: str) -> str:
         return f"rabit:events:replay:{organization_id}"
 
-    def _assert_safe_payload(self, payload: dict) -> None:
-        lowered = {k.lower() for k in payload.keys()}
-        leaked = lowered & FORBIDDEN_PAYLOAD_KEYS
-        if leaked:
-            raise ValueError(f"Refusing to publish event with forbidden payload keys: {leaked}")
+    def _epoch_key(self, organization_id: str) -> str:
+        return f"rabit:events:epoch:{organization_id}"
+
+    def epoch(self, organization_id: str) -> str:
+        """A stable id for the current sequence-counter generation. If Redis
+        loses its keyspace (OOM/restart without persistence), the seq counter
+        rewinds; regenerating the epoch when it's absent lets clients detect
+        the rewind and reset their high-water mark instead of muting forever."""
+        key = self._epoch_key(organization_id)
+        existing = self._redis.get(key)
+        if existing:
+            return existing
+        new = uuid.uuid4().hex
+        # SET NX: first caller wins, everyone reads the same value.
+        self._redis.set(key, new, nx=True)
+        return self._redis.get(key) or new
+
+    def _assert_safe_payload(self, payload) -> None:
+        """Recursively reject any forbidden key (e.g. private_key) at ANY depth,
+        not just the top level - run.tool.* payloads nest tool input/output."""
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                leaked = {k.lower() for k in value.keys()} & FORBIDDEN_PAYLOAD_KEYS
+                if leaked:
+                    raise ValueError(f"Refusing to publish event with forbidden payload keys: {leaked}")
+                for v in value.values():
+                    walk(v)
+            elif isinstance(value, list):
+                for v in value:
+                    walk(v)
+
+        walk(payload)
 
     def next_sequence(self, organization_id: str) -> int:
         return self._redis.incr(self._seq_key(organization_id))

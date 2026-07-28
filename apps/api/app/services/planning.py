@@ -132,7 +132,11 @@ def plan_goal(db, goal: Goal) -> Plan:
         tasks_payload = []
     valid_tasks = [
         t for t in tasks_payload
-        if isinstance(t, dict) and t.get("agent_key") in valid_agent_keys and t.get("risk_level") in ("R0", "R1", "R2")
+        if isinstance(t, dict)
+        and t.get("agent_key") in valid_agent_keys
+        and t.get("risk_level") in ("R0", "R1", "R2")
+        and isinstance(t.get("title"), str) and t.get("title").strip()
+        and isinstance(t.get("description"), str) and t.get("description").strip()
     ]
     if not valid_tasks:
         raise PlanningError(f"CEO agent returned no valid tasks (agent_key must be one of {sorted(valid_agent_keys)}): {tasks_payload}")
@@ -156,12 +160,15 @@ def plan_goal(db, goal: Goal) -> Plan:
 
     created_tasks = []
     for i, item in enumerate(valid_tasks):
-        db.add(PlanStep(plan_id=plan.id, sequence=i, title=item["title"], assigned_agent_key=item["agent_key"]))
+        # title columns are String(300); truncate so a long model title cannot
+        # raise StringDataRightTruncation mid-transaction.
+        item_title = item["title"][:300]
+        db.add(PlanStep(plan_id=plan.id, sequence=i, title=item_title, assigned_agent_key=item["agent_key"]))
         task_row = Task(
             organization_id=goal.organization_id,
             created_by=goal.created_by,
             plan_id=plan.id,
-            title=item["title"],
+            title=item_title,
             description=item["description"],
             assigned_agent_key=item["agent_key"],
             risk_level=item["risk_level"],
