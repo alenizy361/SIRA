@@ -240,3 +240,41 @@ def test_installer_auto_installs_the_claude_cli():
     assert re.search(r"^\s*install_claude_cli\s*$", install_sh, re.MULTILINE), (
         "install_claude_cli is defined but never invoked from main()"
     )
+
+
+def test_expose_remote_checks_local_health_before_installing_anything():
+    """Tunneling a dead local service just hands remote visitors a working
+    HTTPS connection to nothing - the script must verify the company is
+    actually running BEFORE touching apt/cloudflared."""
+    script = (REPO_ROOT / "scripts" / "expose-remote.sh").read_text()
+    assert "health/live" in script
+    # The health check must appear before cloudflared installation begins.
+    check_pos = script.index("health/live")
+    install_pos = script.index("Installing cloudflared")
+    assert check_pos < install_pos
+
+
+def test_expose_remote_tunnel_is_a_restart_always_systemd_service():
+    """The tunnel must survive crashes without any start-rate limit latching
+    it off - the same class of bug fixed earlier in rabit-claude-worker.service."""
+    script = (REPO_ROOT / "scripts" / "expose-remote.sh").read_text()
+    assert "Restart=always" in script
+    assert "StartLimitIntervalSec=0" in script
+
+
+def test_expose_remote_url_extraction_regex_matches_real_cloudflared_output():
+    """Regression check for the exact quick-tunnel banner cloudflared prints -
+    if the format ever drifts this must be updated, not silently return
+    nothing."""
+    import re
+
+    script = (REPO_ROOT / "scripts" / "expose-remote.sh").read_text()
+    m = re.search(r"grep -oE '([^']+trycloudflare[^']+)'", script)
+    assert m, "no trycloudflare.com extraction regex found"
+    pattern = m.group(1)
+    sample = (
+        "2026-07-28T20:15:03Z INF |  https://random-adjective-noun-42.trycloudflare.com"
+        "                                          |\n"
+    )
+    found = re.findall(pattern, sample)
+    assert found and found[-1] == "https://random-adjective-noun-42.trycloudflare.com"
