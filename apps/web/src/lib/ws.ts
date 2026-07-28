@@ -3,6 +3,11 @@ import { useEventStore, WireEvent } from "@/store/eventStore";
 
 const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
+// The server sends a heartbeat every 20s. If we go this long with no frame at
+// all (data OR heartbeat), the connection is half-open (mobile flap, proxy
+// idle-cut, laptop sleep) - onclose may never fire, so we force it and let the
+// backoff reconnect run. ~2.25x the heartbeat interval.
+const STALE_CONNECTION_MS = 45_000;
 
 /**
  * The WebSocket constructor requires an absolute ws(s):// URL - it cannot
@@ -34,6 +39,8 @@ export class RealtimeClient {
   private attempt = 0;
   private closedByUser = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private lastFrameAt = 0;
 
   start() {
     this.closedByUser = false;
@@ -43,8 +50,31 @@ export class RealtimeClient {
   stop() {
     this.closedByUser = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.clearWatchdog();
     this.socket?.close();
     this.socket = null;
+  }
+
+  private markFrame() {
+    this.lastFrameAt = Date.now();
+  }
+
+  private startWatchdog() {
+    this.clearWatchdog();
+    this.markFrame();
+    this.watchdogTimer = setInterval(() => {
+      if (this.socket && Date.now() - this.lastFrameAt > STALE_CONNECTION_MS) {
+        // Force the socket shut so onclose fires and backoff-reconnect runs.
+        this.socket.close();
+      }
+    }, 5_000);
+  }
+
+  private clearWatchdog() {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
   }
 
   private connect() {
@@ -64,9 +94,12 @@ export class RealtimeClient {
     socket.onopen = () => {
       this.attempt = 0;
       useEventStore.getState().setWsStatus("open");
+      this.startWatchdog();
     };
 
     socket.onmessage = (msg) => {
+      // Any frame - data OR heartbeat - proves the connection is alive.
+      this.markFrame();
       try {
         const data = JSON.parse(msg.data);
         if (data.type === "hello" || data.type === "heartbeat") return;
@@ -80,6 +113,7 @@ export class RealtimeClient {
 
     socket.onclose = () => {
       this.socket = null;
+      this.clearWatchdog();
       if (this.closedByUser) {
         useEventStore.getState().setWsStatus("closed");
         return;

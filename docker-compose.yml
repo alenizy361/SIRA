@@ -8,9 +8,12 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-rabit_os}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # Never publish 5432 to the host in production - internal network only.
-    expose:
-      - "5432"
+    # Publish to LOOPBACK ONLY (127.0.0.1) - never 0.0.0.0. The claude-worker
+    # runs directly on the host (not in this compose network) and reaches
+    # Postgres via DATABASE_URL=...@localhost:5432, so a host binding is
+    # required; binding to 127.0.0.1 keeps it off any public interface.
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rabit} -d ${POSTGRES_DB:-rabit_os}"]
       interval: 5s
@@ -22,8 +25,11 @@ services:
     restart: unless-stopped
     volumes:
       - redis_data:/data
-    expose:
-      - "6379"
+    # Loopback-only host binding (see the postgres note): the host worker's
+    # EventBus connects to redis://localhost:6379, so it must be reachable on
+    # the host, but never on a public interface.
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

@@ -87,7 +87,11 @@
     "transmissions": "Live transmissions",
     "request_plan": "Ask the CEO to plan this",
     "plan_requested": "Planning requested — agents are working now",
-    "plan_already_requested": "Planning already in progress for this goal"
+    "plan_already_requested": "Planning already in progress for this goal",
+    "conversation": "Agent conversation",
+    "conversation_hint": "Create a goal and request planning to watch the agents converse and execute live.",
+    "thinking": "thinking…",
+    "core_stage": "Central core"
   },
   "goals": {
     "title": "Goals",

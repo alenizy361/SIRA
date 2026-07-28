@@ -2,6 +2,7 @@ from .state_machine import GoalState, TaskState, transition_goal, transition_tas
 from .retry import compute_backoff_seconds
 from .leasing import acquire_lease, expire_stale_leases, release_lease, renew_heartbeat
 from .scheduler import pick_ready_tasks
+from .progression import advance_ready_pipeline
 
 __all__ = [
     "GoalState",
@@ -15,4 +16,5 @@ __all__ = [
     "release_lease",
     "renew_heartbeat",
     "pick_ready_tasks",
+    "advance_ready_pipeline",
 ]

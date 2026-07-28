@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AICore } from "@/components/AICore";
+import { AICore, coreStateColor } from "@/components/AICore";
 import { useEventStore, type CoreState } from "@/store/eventStore";
 import { agentMeta } from "@/lib/agentMeta";
 import { useI18n } from "@/i18n/I18nProvider";
@@ -101,8 +101,24 @@ export function AgentOrbit({ agents, coreState }: { agents: AgentLite[]; coreSta
 
   const activeBeams = beamsRef.current.filter((b) => now - b.bornAt < BEAM_MS);
 
+  // Energy 0..1 from how many events landed in the last few seconds - feeds
+  // the core so it visibly surges while the agents are active.
+  const energy = useMemo(() => {
+    const cutoff = now - 5000;
+    const recent = events.filter((e) => new Date(e.timestamp).getTime() > cutoff).length;
+    return Math.max(0, Math.min(1, recent / 8));
+  }, [events, now]);
+
+  const bloom = coreStateColor(coreState);
+
   return (
-    <div className="relative aspect-square w-full overflow-hidden rounded-2xl border border-white/10 bg-[radial-gradient(circle_at_50%_45%,#0b1220_0%,#05070d_70%)]">
+    <div className="relative aspect-square w-full overflow-hidden rounded-3xl border border-white/10 bg-[radial-gradient(circle_at_50%_45%,#0b1220_0%,#04060c_72%)]">
+      {/* bloom halo behind the core, tinted by state */}
+      <div
+        className="core-bloom"
+        style={{ ["--bloom" as string]: `${bloom}3a`, opacity: 0.4 + energy * 0.25 }}
+        aria-hidden
+      />
       {/* faint orbital guide rings */}
       <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none">
         {rings.map((r, i) => (
@@ -140,8 +156,8 @@ export function AgentOrbit({ agents, coreState }: { agents: AgentLite[]; coreSta
       </svg>
 
       {/* the core */}
-      <div className="absolute left-1/2 top-1/2 h-[42%] w-[42%] -translate-x-1/2 -translate-y-1/2">
-        <AICore state={coreState} />
+      <div className="absolute left-1/2 top-1/2 h-[46%] w-[46%] -translate-x-1/2 -translate-y-1/2">
+        <AICore state={coreState} energy={energy} />
       </div>
 
       {/* agent nodes */}

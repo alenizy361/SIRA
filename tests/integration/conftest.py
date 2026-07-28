@@ -56,9 +56,16 @@ def org_id(db):
     # Delete in FK dependency order - this is sandbox test data cleanup,
     # not a production data-retention path.
     oid = str(org.id)
-    db.execute(text("DELETE FROM run_leases WHERE task_id IN (SELECT id FROM tasks WHERE organization_id = :id)"), {"id": oid})
+    task_subq = "SELECT id FROM tasks WHERE organization_id = :id"
+    run_subq = "SELECT id FROM runs WHERE organization_id = :id"
+    db.execute(text("DELETE FROM run_leases WHERE task_id IN (" + task_subq + ")"), {"id": oid})
+    # Rows that reference runs (must go before runs are deleted).
+    for tbl in ("tool_calls", "run_events", "validations"):
+        db.execute(text(f"DELETE FROM {tbl} WHERE run_id IN (" + run_subq + ")"), {"id": oid})
     db.execute(text("DELETE FROM runs WHERE organization_id = :id"), {"id": oid})
-    db.execute(text("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE organization_id = :id)"), {"id": oid})
+    # Rows that reference tasks (must go before tasks are deleted).
+    for tbl in ("task_dependencies", "retry_records", "task_attempts", "cancellations", "reviews"):
+        db.execute(text(f"DELETE FROM {tbl} WHERE task_id IN (" + task_subq + ")"), {"id": oid})
     db.execute(text("DELETE FROM tasks WHERE organization_id = :id"), {"id": oid})
     db.execute(text("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE organization_id = :id)"), {"id": oid})
     db.execute(text("DELETE FROM plans WHERE organization_id = :id"), {"id": oid})

@@ -15,6 +15,14 @@ COPY apps/api /app/apps/api
 
 ENV PYTHONPATH=/app/apps/api:/app/packages:/app/packages/permission-engine:/app/services:/app/services/claude-worker
 
+# Run as a non-root user so an RCE/path-traversal in the FastAPI app does not
+# execute as uid 0 in-container - this is the enforcement the systemd unit
+# (infra/systemd/rabit-api.service) already documents as living "in the
+# Dockerfile". The agent-specs bind mount is read-only, so read access under
+# this uid is sufficient.
+RUN useradd -r -u 10001 appuser && chown -R appuser /app
+USER appuser
+
 WORKDIR /app/apps/api
 
 EXPOSE 8000

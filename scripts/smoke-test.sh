@@ -37,7 +37,7 @@ sync_env_defaults
 FAILURES=0
 
 check_http() {
-  local name="$1" url="$2"
+  local name="$1" url="$2" accept="${3:-^200$}"
   local code attempt
   # A freshly (re)started container/systemd unit is not instantly ready -
   # Type=simple systemd units are marked "active" the moment the process is
@@ -48,13 +48,13 @@ check_http() {
   # started). Retry for up to ~30s before giving up for real.
   for attempt in $(seq 1 15); do
     code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" || echo 000)"
-    [[ "$code" == "200" ]] && break
+    [[ "$code" =~ $accept ]] && break
     sleep 2
   done
-  if [[ "$code" == "200" ]]; then
+  if [[ "$code" =~ $accept ]]; then
     log_ok "${name}: ${url} -> HTTP ${code}"
   else
-    log_error "${name}: ${url} -> HTTP ${code} (expected 200, gave up after ~30s of retries)"
+    log_error "${name}: ${url} -> HTTP ${code} (expected ${accept}, gave up after ~30s of retries)"
     FAILURES=$((FAILURES + 1))
     return 1
   fi
@@ -102,7 +102,9 @@ log_step "Smoke test starting (API_URL=${API_URL}, WEB_URL=${WEB_URL})"
 check_http "API live"          "${API_URL}/health/live"          || { echo "SMOKE TEST FAILED: API liveness check failed."; exit 1; }
 check_http "API ready"         "${API_URL}/health/ready"         || { echo "SMOKE TEST FAILED: API readiness check failed."; exit 1; }
 check_http "API dependencies"  "${API_URL}/health/dependencies"  || { echo "SMOKE TEST FAILED: API dependency check failed."; exit 1; }
-check_http "Web root"          "${WEB_URL}/"                     || { echo "SMOKE TEST FAILED: web app root did not return HTTP 200."; exit 1; }
+# The web root force-redirects ("/" -> 307 -> /command-center), so a healthy
+# stack returns 3xx here, not 200. Accept 2xx and 3xx for the root check.
+check_http "Web root"          "${WEB_URL}/"           '^(200|30[0-9])$' || { echo "SMOKE TEST FAILED: web app root did not respond (expected 2xx/3xx)."; exit 1; }
 check_postgres                                                    || { echo "SMOKE TEST FAILED: Postgres is not reachable."; exit 1; }
 check_redis                                                        || { echo "SMOKE TEST FAILED: Redis is not reachable."; exit 1; }
 

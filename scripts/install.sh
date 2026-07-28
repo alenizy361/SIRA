@@ -386,7 +386,11 @@ generate_env() {
   log_step "Generating .env from .env.example (CHANGE_ME values replaced with generated secrets)"
   umask 077
   : > "$target"
-  local line key value secret
+  # One shared DB password so the value embedded in DATABASE_URL matches
+  # POSTGRES_PASSWORD (both carry CHANGE_ME in .env.example). Everything else
+  # (e.g. SESSION_SECRET_KEY) gets its own per-key random secret.
+  local line key value secret db_pw
+  db_pw="$(openssl rand -hex 32)"
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *=* ]]; then
       echo "$line" >> "$target"
@@ -395,8 +399,20 @@ generate_env() {
     key="${line%%=*}"
     value="${line#*=}"
     if [[ "$value" == *CHANGE_ME* ]]; then
-      secret="$(openssl rand -hex 32)"
-      echo "${key}=${secret}" >> "$target"
+      # Substitute the CHANGE_ME token IN PLACE so structured values like
+      # DATABASE_URL=postgresql+psycopg://rabit:CHANGE_ME@localhost:5432/rabit_os
+      # keep their scheme/host/db instead of being replaced wholesale by a
+      # bare hex string (which SQLAlchemy cannot parse -> worker crash-loop).
+      case "$key" in
+        POSTGRES_PASSWORD|DATABASE_URL)
+          value="${value//CHANGE_ME/$db_pw}"
+          ;;
+        *)
+          secret="$(openssl rand -hex 32)"
+          value="${value//CHANGE_ME/$secret}"
+          ;;
+      esac
+      echo "${key}=${value}" >> "$target"
     else
       echo "$line" >> "$target"
     fi
@@ -520,6 +536,13 @@ configure_nginx() {
   fi
 
   ln -sf /etc/nginx/sites-available/rabit-os.conf /etc/nginx/sites-enabled/rabit-os.conf
+
+  # Ubuntu's stock nginx ships an enabled default site that also declares
+  # `listen 80 default_server`. Leaving it enabled alongside our config (which
+  # marks itself default_server on the no-DOMAIN path) makes `nginx -t` fail
+  # with "a duplicate default server for 0.0.0.0:80" and aborts the install.
+  # This app owns port 80 on its host, so remove the stock default site.
+  rm -f /etc/nginx/sites-enabled/default
 
   if nginx -t; then
     if is_systemd_pid1; then

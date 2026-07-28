@@ -59,16 +59,21 @@ export const useEventStore = create<EventStoreState>((set) => ({
   setWsStatus: (status) =>
     set((state) => ({
       wsStatus: status,
+      // The connection status drives the header dot; it must NOT clobber the
+      // real agent core state. A 1s network blip during a "deploying" run used
+      // to reset the core to "connecting" -> "idle" and leave it wrong for the
+      // rest of the run (replay only resends events with seq > since_seq, so
+      // the last core.state.changed is never re-sent on a mid-session
+      // reconnect). Preserve the last known real state; only fall back to a
+      // placeholder when we genuinely have none.
       coreState:
         status === "open"
-          ? state.coreState === "connecting"
+          ? state.coreState === "connecting" || state.coreState === "offline"
             ? "idle"
             : state.coreState
-          : status === "reconnecting" || status === "connecting"
-            ? "connecting"
-            : status === "closed"
-              ? "offline"
-              : state.coreState,
+          : status === "closed"
+            ? "offline"
+            : state.coreState,
     })),
   pushEvent: (event) =>
     set((state) => {

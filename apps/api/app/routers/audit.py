@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session as DbSession
 
 from app.auth.dependencies import get_current_user
@@ -10,12 +10,18 @@ router = APIRouter(prefix="/audit-logs", tags=["audit"])
 
 
 @router.get("")
-def list_audit_logs(limit: int = 100, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+def list_audit_logs(
+    limit: int = Query(100, ge=1, le=500),
+    user: User = Depends(get_current_user),
+    db: DbSession = Depends(get_db),
+):
+    # `limit` is bounded to [1, 500] by Query() so a crafted ?limit=-1 can no
+    # longer reach Postgres as a negative LIMIT (which 500s).
     rows = (
         db.query(AuditLog)
         .filter(AuditLog.organization_id == user.organization_id)
         .order_by(AuditLog.created_at.desc())
-        .limit(min(limit, 500))
+        .limit(limit)
         .all()
     )
     return [

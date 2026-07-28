@@ -15,6 +15,7 @@ if str(_API_ROOT) not in sys.path:
     sys.path.insert(0, str(_API_ROOT))
 
 from app.models.work import RunLease  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 
@@ -65,7 +66,17 @@ def acquire_lease(
         heartbeat_at=now,
     )
     db.add(lease)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # SELECT ... FOR UPDATE SKIP LOCKED does not lock the empty gap, so two
+        # workers can both read "no lease" and both INSERT; likewise a lease
+        # row locked by another worker is SKIPped and read as absent. Either
+        # way the loser's INSERT violates the task_id UNIQUE constraint. Honor
+        # the documented contract: translate that into LeaseNotAcquired rather
+        # than letting a raw IntegrityError abort the caller's poll tick.
+        db.rollback()
+        raise LeaseNotAcquired(f"Task {task_id} was leased concurrently by another worker")
     db.refresh(lease)
     return lease
 

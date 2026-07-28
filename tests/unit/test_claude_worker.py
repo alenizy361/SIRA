@@ -67,9 +67,11 @@ def test_parse_stream_line_drops_thinking_blocks():
             },
         }
     )
-    event = _parse_stream_line(line)
+    events = _parse_stream_line(line)
+    assert len(events) == 1
+    event = events[0]
     assert event["kind"] == "final_text"
-    assert "secret reasoning chain" not in json.dumps(event)
+    assert "secret reasoning chain" not in json.dumps(events)
 
 
 def test_parse_stream_line_captures_tool_call_and_redacts_secrets():
@@ -85,7 +87,9 @@ def test_parse_stream_line_captures_tool_call_and_redacts_secrets():
             },
         }
     )
-    event = _parse_stream_line(line)
+    events = _parse_stream_line(line)
+    assert len(events) == 1
+    event = events[0]
     assert event["kind"] == "tool_call"
     assert event["input"]["api_key"] == "***REDACTED***"
     assert event["input"]["command"] == "ls"
@@ -109,7 +113,9 @@ def test_parse_stream_line_captures_tool_result():
             },
         }
     )
-    event = _parse_stream_line(line)
+    events = _parse_stream_line(line)
+    assert len(events) == 1
+    event = events[0]
     assert event["kind"] == "tool_result"
     assert event["tool_use_id"] == "toolu_123"
     assert event["is_error"] is False
@@ -129,14 +135,56 @@ def test_parse_stream_line_tool_result_error_flag():
             },
         }
     )
-    event = _parse_stream_line(line)
+    events = _parse_stream_line(line)
+    assert len(events) == 1
+    event = events[0]
     assert event["kind"] == "tool_result"
     assert event["is_error"] is True
 
 
 def test_parse_stream_line_text_fallback_for_non_json():
-    event = _parse_stream_line("plain text output from an older CLI build")
-    assert event["kind"] == "text_fallback"
+    events = _parse_stream_line("plain text output from an older CLI build")
+    assert len(events) == 1
+    assert events[0]["kind"] == "text_fallback"
+
+
+def test_parse_stream_line_emits_text_and_all_tool_uses_in_one_message():
+    import json
+
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Working on it."},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "a.py"}},
+                    {"type": "tool_use", "name": "Edit", "input": {"file_path": "b.py"}},
+                ]
+            },
+        }
+    )
+    events = _parse_stream_line(line)
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["final_text", "tool_call", "tool_call"]
+    assert [e["tool_name"] for e in events if e["kind"] == "tool_call"] == ["Read", "Edit"]
+
+
+def test_tool_result_scrubs_secret_value():
+    import json
+
+    line = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "DATABASE_PASSWORD=hunter2supersecret"}
+                ]
+            },
+        }
+    )
+    event = _parse_stream_line(line)[0]
+    assert "hunter2supersecret" not in event["content_preview"]
+    assert "***REDACTED***" in event["content_preview"]
 
 
 def test_redact_helper():
@@ -144,6 +192,12 @@ def test_redact_helper():
         "password": "***REDACTED***",
         "path": "/tmp/x",
     }
+
+
+def test_redact_scrubs_secret_in_innocuous_key_value():
+    redacted = _redact({"command": "curl -H 'Authorization: Bearer abcdef123456ghijkl'"})
+    assert "abcdef123456ghijkl" not in redacted["command"]
+    assert "***REDACTED***" in redacted["command"]
 
 
 def test_permission_mode_maps_risk_to_safe_default():

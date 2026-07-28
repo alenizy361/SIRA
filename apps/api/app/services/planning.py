@@ -114,8 +114,26 @@ def plan_goal(db, goal: Goal) -> Plan:
     except json.JSONDecodeError as exc:
         raise PlanningError(f"CEO agent did not return valid JSON: {result.result_summary[:500]!r}") from exc
 
+    # --json-schema is only enforced when the CLI supports it; otherwise the
+    # response is free-form, so validate the shape here rather than letting a
+    # KeyError/AttributeError escape (which would strand the goal mid-plan).
+    if not isinstance(parsed, dict):
+        raise PlanningError(f"CEO agent returned non-object JSON ({type(parsed).__name__}): {str(parsed)[:300]!r}")
+
+    plan_title = parsed.get("plan_title")
+    if not isinstance(plan_title, str) or not plan_title.strip():
+        raise PlanningError(f"CEO agent response missing required 'plan_title': {str(parsed)[:300]!r}")
+    summary = parsed.get("summary")
+    if not isinstance(summary, str):
+        summary = ""
+
     tasks_payload = parsed.get("tasks", [])
-    valid_tasks = [t for t in tasks_payload if t.get("agent_key") in valid_agent_keys and t.get("risk_level") in ("R0", "R1", "R2")]
+    if not isinstance(tasks_payload, list):
+        tasks_payload = []
+    valid_tasks = [
+        t for t in tasks_payload
+        if isinstance(t, dict) and t.get("agent_key") in valid_agent_keys and t.get("risk_level") in ("R0", "R1", "R2")
+    ]
     if not valid_tasks:
         raise PlanningError(f"CEO agent returned no valid tasks (agent_key must be one of {sorted(valid_agent_keys)}): {tasks_payload}")
 
@@ -129,8 +147,8 @@ def plan_goal(db, goal: Goal) -> Plan:
         organization_id=goal.organization_id,
         created_by=goal.created_by,
         goal_id=goal.id,
-        title=parsed["plan_title"],
-        summary=parsed["summary"],
+        title=plan_title[:300],
+        summary=summary,
         state="drafted",
     )
     db.add(plan)

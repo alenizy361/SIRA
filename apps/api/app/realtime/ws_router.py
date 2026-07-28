@@ -10,6 +10,7 @@ Protocol (constitution section 15):
 """
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
@@ -48,7 +49,12 @@ def _authenticate_ws(cookie_header: str | None, db: DbSession) -> User | None:
         return None
     if not session or not validate_session(session, raw_token):
         return None
-    return db.get(User, session.user_id)
+    user = db.get(User, session.user_id)
+    # Mirror the REST dependency (get_current_user): a deactivated account with
+    # a still-valid cookie must not keep streaming the org's realtime feed.
+    if user is None or not user.is_active:
+        return None
+    return user
 
 
 @router.websocket("/ws")
@@ -70,10 +76,24 @@ async def websocket_endpoint(websocket: WebSocket, since_seq: int = 0):
 
     await websocket.send_text(json.dumps({"type": "hello", "organization_id": organization_id}))
 
+    # Subscribe to the live channel BEFORE reading the replay slice. Otherwise
+    # an event published in the window between "read replay" and "subscribe"
+    # is in neither and is lost for the life of the connection. Subscribing
+    # first means such an event arrives on the live channel; we then de-dup by
+    # sequence against what replay already delivered.
+    pubsub = bus.pubsub(organization_id)
+
+    last_sent_seq = since_seq
     for event in bus.replay_since(organization_id, since_seq):
         await websocket.send_text(json.dumps(event))
+        seq = event.get("sequence")
+        if isinstance(seq, int) and seq > last_sent_seq:
+            last_sent_seq = seq
 
-    pubsub = bus.pubsub(organization_id)
+    # A dedicated single-thread executor for the blocking pubsub poll, so this
+    # connection's poller can never occupy a slot in asyncio's shared default
+    # ThreadPoolExecutor (which DB work and every other run_in_executor needs).
+    poll_executor = ThreadPoolExecutor(max_workers=1)
 
     async def heartbeat_loop():
         while True:
@@ -81,11 +101,23 @@ async def websocket_endpoint(websocket: WebSocket, since_seq: int = 0):
             await websocket.send_text(json.dumps({"type": "heartbeat"}))
 
     async def forward_loop():
+        nonlocal last_sent_seq
         loop = asyncio.get_event_loop()
         while True:
-            message = await loop.run_in_executor(None, pubsub.get_message, True, 1.0)
-            if message and message.get("type") == "message":
-                await websocket.send_text(message["data"])
+            message = await loop.run_in_executor(poll_executor, pubsub.get_message, True, 1.0)
+            if not message or message.get("type") != "message":
+                continue
+            data = message["data"]
+            try:
+                seq = json.loads(data).get("sequence")
+            except (ValueError, TypeError):
+                seq = None
+            # Skip anything already delivered in the replay slice above.
+            if isinstance(seq, int):
+                if seq <= last_sent_seq:
+                    continue
+                last_sent_seq = seq
+            await websocket.send_text(data)
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     forward_task = asyncio.create_task(forward_loop())
@@ -100,3 +132,4 @@ async def websocket_endpoint(websocket: WebSocket, since_seq: int = 0):
         heartbeat_task.cancel()
         forward_task.cancel()
         pubsub.close()
+        poll_executor.shutdown(wait=False)

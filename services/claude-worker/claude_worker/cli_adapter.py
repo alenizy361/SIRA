@@ -13,18 +13,24 @@ cannot achieve shell injection (constitution section 7.11).
 from __future__ import annotations
 
 import json
+import logging
 import os
+import queue
 import re
 import signal
 import subprocess
+import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from .prompt_builder import build_prompt
 from .task_contract import TaskContract
+
+logger = logging.getLogger("claude_worker.cli_adapter")
 
 THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 
@@ -288,6 +294,36 @@ class ClaudeCodeAdapter:
             result_summary = ""
             timed_out = False
 
+            # stdout is pumped by a background thread into a queue so the main
+            # loop can honor the wall-clock deadline even when the CLI stalls
+            # WITHOUT emitting output (a blocking readline() here would ignore
+            # the timeout entirely and wedge the whole single-threaded worker).
+            # stderr is drained concurrently into a bounded buffer so a chatty
+            # run can never fill the OS pipe and deadlock the subprocess.
+            line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+            stderr_chunks: deque[str] = deque(maxlen=400)
+
+            def _pump_stdout() -> None:
+                try:
+                    if process.stdout is not None:
+                        for line in iter(process.stdout.readline, ""):
+                            line_queue.put(line)
+                finally:
+                    line_queue.put(None)  # sentinel: stdout reached EOF
+
+            def _pump_stderr() -> None:
+                try:
+                    if process.stderr is not None:
+                        for line in iter(process.stderr.readline, ""):
+                            stderr_chunks.append(line)
+                except Exception:  # noqa: BLE001 - draining is best-effort
+                    pass
+
+            stdout_thread = threading.Thread(target=_pump_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=_pump_stderr, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
             deadline = started_at + task.timeout_seconds
             try:
                 while True:
@@ -296,24 +332,38 @@ class ClaudeCodeAdapter:
                         timed_out = True
                         handle.cancel()
                         break
-                    line = process.stdout.readline()
-                    if line == "" and process.poll() is not None:
-                        break
-                    if not line:
+                    try:
+                        line = line_queue.get(timeout=min(remaining, 1.0))
+                    except queue.Empty:
                         continue
+                    if line is None:
+                        break  # stdout closed -> the process is done emitting
                     stdout_lines.append(line)
-                    event = _parse_stream_line(line)
-                    if event is None:
-                        continue
-                    if event.get("kind") == "tool_call":
-                        tool_calls.append(event)
-                    if event.get("kind") == "final_text":
-                        result_summary = event.get("text", result_summary)
-                    if on_event:
-                        on_event(event)
+                    for event in _parse_stream_line(line):
+                        if event.get("kind") == "tool_call":
+                            tool_calls.append(event)
+                        if event.get("kind") == "final_text":
+                            result_summary = event.get("text", result_summary)
+                        if on_event:
+                            try:
+                                on_event(event)
+                            except Exception:  # noqa: BLE001
+                                logger.exception("on_event callback failed for run %s", run_id)
             finally:
-                stderr_output = process.stderr.read() if process.stderr else ""
-                process.wait(timeout=10)
+                # Reap the process; if it lingers (e.g. a killed group slow to
+                # exit) force-kill and move on rather than raising out of the
+                # finally and leaving the caller's task wedged in RUNNING.
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    handle.cancel()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.error("Run %s did not exit after cancel()", run_id)
+                stdout_thread.join(timeout=2)
+                stderr_thread.join(timeout=2)
+                stderr_output = "".join(stderr_chunks)
 
             changed_files: list[str] = []
             diff_stat = ""
@@ -377,56 +427,110 @@ class ClaudeCodeAdapter:
         return handle, _wait
 
 
-def _parse_stream_line(line: str) -> Optional[dict]:
-    """Parses one line of --output-format stream-json and returns a SAFE
-    event dict (never includes thinking/redacted_thinking content blocks -
-    constitution: "must not expose or persist hidden chain-of-thought")."""
+def _parse_stream_line(line: str) -> list[dict]:
+    """Parses one line of --output-format stream-json and returns the list of
+    SAFE events it carries (never includes thinking/redacted_thinking content
+    blocks - constitution: "must not expose or persist hidden chain-of-thought").
+
+    Returns a LIST because a single assistant message routinely holds multiple
+    content blocks (e.g. a text block followed by one or more tool_use blocks,
+    or several parallel tool_use blocks); emitting only the first would drop
+    every sibling tool call and desync run.tool.started/completed on the
+    dashboard. An empty list means the line carried nothing forwardable."""
     line = line.strip()
     if not line:
-        return None
+        return []
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
         # Text-fallback mode: treat the raw line as plain progress text.
-        return {"kind": "text_fallback", "text": line}
+        return [{"kind": "text_fallback", "text": line}]
 
     msg_type = obj.get("type")
+    events: list[dict] = []
     if msg_type == "assistant":
         content = obj.get("message", {}).get("content", [])
         for block in content:
-            if block.get("type") in THINKING_BLOCK_TYPES:
+            if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use":
-                return {"kind": "tool_call", "tool_name": block.get("name"), "input": _redact(block.get("input", {}))}
-            if block.get("type") == "text":
-                return {"kind": "final_text", "text": block.get("text", "")}
+            btype = block.get("type")
+            if btype in THINKING_BLOCK_TYPES:
+                continue
+            if btype == "tool_use":
+                events.append({"kind": "tool_call", "tool_name": block.get("name"), "input": _redact(block.get("input", {}))})
+            elif btype == "text":
+                events.append({"kind": "final_text", "text": block.get("text", "")})
+        return events
     if msg_type == "user":
         # Tool RESULTS arrive as a "user"-role message in the stream-json
         # protocol (the CLI feeding the tool's output back to the model) -
         # this is the completion signal paired with the "tool_call" kind
         # above, needed to emit a run.tool.completed event alongside
-        # run.tool.started.
+        # run.tool.started. The tool's OUTPUT is untrusted and routinely
+        # contains secrets (e.g. `cat .env`), so it is scrubbed before it can
+        # reach the event bus / replay log.
         content = obj.get("message", {}).get("content", [])
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 raw_content = block.get("content", "")
                 preview = raw_content if isinstance(raw_content, str) else json.dumps(raw_content)
-                return {
+                events.append({
                     "kind": "tool_result",
                     "tool_use_id": block.get("tool_use_id"),
                     "is_error": bool(block.get("is_error", False)),
-                    "content_preview": preview[:500],
-                }
+                    "content_preview": _scrub_secrets(preview[:2000])[:500],
+                })
+        return events
     if msg_type == "result":
-        return {"kind": "final_text", "text": obj.get("result", "")}
-    return {"kind": "other", "raw_type": msg_type}
+        return [{"kind": "final_text", "text": obj.get("result", "")}]
+    return [{"kind": "other", "raw_type": msg_type}]
 
 
 _SECRET_KEY_PATTERN = re.compile(r"(password|secret|api[_-]?key|token|credential)", re.IGNORECASE)
 
+# Value-level secret shapes. Tool inputs and outputs carry secrets under
+# innocuous keys ({"command": "curl -H 'Authorization: Bearer ...'"}), so key
+# names alone are not enough - the values themselves must be scrubbed.
+_SECRET_VALUE_PATTERNS = [
+    re.compile(r"AKIA[0-9A-Z]{16}"),                                   # AWS access key id
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),                           # sk- style API keys
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{12,}"),                  # bearer tokens
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),                         # GitHub tokens
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),                       # Slack tokens
+    re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s\"']*:[^\s\"'@/]+@"),  # creds in a URL
+    re.compile(r"(?i)(password|secret|api[_-]?key|token|credential)\s*[=:]\s*\S+"),  # KEY=VALUE / KEY: VALUE
+]
 
-def _redact(payload: dict) -> dict:
-    return {
-        k: ("***REDACTED***" if _SECRET_KEY_PATTERN.search(k) else v)
-        for k, v in payload.items()
-    }
+
+def _scrub_secrets(text):
+    """Redacts common secret shapes from a free-text value. Best-effort and
+    intentionally err-on-the-safe-side, since this feeds a broadcast/replayed
+    preview that must never carry credentials."""
+    if not isinstance(text, str):
+        return text
+    scrubbed = text
+    for pat in _SECRET_VALUE_PATTERNS:
+        scrubbed = pat.sub("***REDACTED***", scrubbed)
+    return scrubbed
+
+
+def _redact(payload):
+    """Redacts a tool-input structure recursively: a value is dropped when its
+    KEY name looks secret, and every remaining string value is run through the
+    value-level scrubber (so secrets under innocuous keys, or nested inside
+    lists/dicts, are caught too)."""
+    def _walk(value):
+        if isinstance(value, dict):
+            return {
+                k: ("***REDACTED***" if _SECRET_KEY_PATTERN.search(str(k)) else _walk(v))
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [_walk(v) for v in value]
+        if isinstance(value, str):
+            return _scrub_secrets(value)
+        return value
+
+    if not isinstance(payload, dict):
+        return payload
+    return _walk(payload)

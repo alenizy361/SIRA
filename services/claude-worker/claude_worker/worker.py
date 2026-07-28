@@ -29,9 +29,10 @@ from app.db import get_sessionmaker  # noqa: E402
 from app.models.work import Task  # noqa: E402
 from app.realtime.publisher import publish, publish_core_state  # noqa: E402
 from contracts.events import CoreState, EntityRef, EventType  # noqa: E402
-from orchestrator.leasing import LeaseNotAcquired, acquire_lease, release_lease  # noqa: E402
+from orchestrator.leasing import LeaseNotAcquired, acquire_lease, expire_stale_leases, release_lease  # noqa: E402
+from orchestrator.progression import advance_ready_pipeline  # noqa: E402
 from orchestrator.scheduler import pick_ready_tasks  # noqa: E402
-from orchestrator.state_machine import TaskState, transition_task  # noqa: E402
+from orchestrator.state_machine import InvalidTransition, TaskState, transition_task  # noqa: E402
 
 from .cli_adapter import AuthenticationRequiredError, ClaudeCodeAdapter
 from .task_contract import TaskContract
@@ -74,6 +75,10 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
     from app.models.identity import Organization
 
     executed = 0
+    # Reclaim leases stranded by a crashed/killed worker so their tasks become
+    # schedulable again instead of being stuck forever behind a dead lease
+    # (constitution section 6 restart-recovery). Cheap and global; runs once.
+    expire_stale_leases(db)
     for org_id, autonomy_mode in db.query(Organization.id, Organization.autonomy_mode).all():
         if autonomy_mode not in AUTONOMOUS_EXECUTION_MODES:
             continue
@@ -82,7 +87,12 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
         #    `claude` CLI's authenticated session - see request_plan() in
         #    apps/api/app/routers/goals.py.
         executed += _run_pending_plans(db, org_id)
-        # 2. Tasks a plan produced, ready for an engineer/analyst agent to run.
+        # 2. Move stranded tasks forward: retry-backoff RETRY_WAIT->READY and
+        #    cancel dependents of a dead prerequisite. Without this a single
+        #    transient failure parks a task in RETRY_WAIT permanently. Not
+        #    counted as "executed" - it triggers no CLI invocation itself.
+        advance_ready_pipeline(db, org_id)
+        # 3. Tasks a plan produced, ready for an engineer/analyst agent to run.
         ready = pick_ready_tasks(db, org_id, agent_concurrency_limits)
         for task in ready:
             executed += _execute_task(db, adapter, task)
@@ -106,18 +116,31 @@ def _run_pending_plans(db, org_id) -> int:
         meta = dict(goal.metadata_json or {})
         if meta.get("plan_status") != "requested":
             continue
-        # Claim it first so a second worker tick (or a second worker) never
-        # double-plans the same goal.
-        meta["plan_status"] = "running"
-        goal.metadata_json = meta
-        db.add(goal)
-        db.commit()
+        # Claim it atomically so a second worker tick (or a second worker)
+        # never double-plans the same goal. A plain read-modify-write is racy;
+        # take a row lock and RE-CHECK the flag under the lock (on Postgres
+        # this is a genuine mutual exclusion; on a single-threaded test DB it
+        # degrades harmlessly to the same check).
+        locked = db.query(Goal).filter(Goal.id == goal.id).with_for_update().one()
+        locked_meta = dict(locked.metadata_json or {})
+        if locked_meta.get("plan_status") != "requested":
+            db.commit()  # release the row lock; someone else claimed it
+            continue
+        locked_meta["plan_status"] = "running"
+        locked.metadata_json = locked_meta
+        db.add(locked)
+        db.commit()  # commit releases the lock and publishes the claim
+        goal = locked
 
         publish_core_state(org_id, CoreState.PLANNING, "ceo", str(goal.id))
         try:
             plan = plan_goal(db, goal)
-        except PlanningError as exc:
-            logger.error("Planning failed for goal %s: %s", goal.id, exc)
+        except Exception as exc:  # noqa: BLE001 - any failure must not strand the goal
+            # Previously only PlanningError was caught, so a KeyError/AttributeError
+            # from a malformed CEO response left the goal pinned at
+            # plan_status='running' forever (never re-selected, never failed).
+            logger.exception("Planning failed for goal %s", goal.id)
+            db.rollback()
             db.refresh(goal)
             meta = dict(goal.metadata_json or {})
             meta["plan_status"] = "failed"
@@ -250,6 +273,8 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         return 1
     except AuthenticationRequiredError:
         logger.error("Claude CLI not authenticated - pausing this task, will retry once an operator logs in.")
+        db.rollback()
+        db.refresh(task)
         task.state = transition_task(TaskState(task.state), TaskState.BLOCKED).value
         db.add(task)
         db.commit()
@@ -259,8 +284,48 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
             payload={"reason": "claude_cli_not_authenticated"}, entities=_task_entities(task, run),
         )
         return 0
+    except Exception:  # noqa: BLE001 - never leave a task stuck in RUNNING
+        # A missing CLI, a subprocess timeout, a worktree collision, a Redis
+        # publish blip - anything other than an auth error - would otherwise
+        # propagate out with the task committed as RUNNING and no lease-free
+        # path back to READY. Land it in RETRY_WAIT (so the progression driver
+        # can retry it) or FAILED if the current state can't retry.
+        logger.exception("Unexpected error executing task %s - marking recoverable", task.id)
+        db.rollback()
+        try:
+            db.refresh(task)
+        except Exception:  # noqa: BLE001
+            pass
+        _mark_task_recoverable(db, task, run, org_id, actor)
+        return 0
     finally:
         release_lease(db, task.id, worker_id=WORKER_ID)
+
+
+def _mark_task_recoverable(db, task: "Task", run, org_id, actor: str) -> None:
+    """Best-effort transition of a task out of RUNNING after an unexpected
+    failure: RETRY_WAIT if allowed, else FAILED, else left as-is with the run
+    marked failed. Swallows secondary errors so the poll loop keeps running."""
+    for target in (TaskState.RETRY_WAIT, TaskState.FAILED):
+        try:
+            task.state = transition_task(TaskState(task.state), target).value
+            break
+        except InvalidTransition:
+            continue
+    try:
+        if run is not None:
+            run.state = "failed"
+            db.add(run)
+        db.add(task)
+        db.commit()
+        publish(
+            org_id, EventType.TASK_BLOCKED, actor, str(task.id),
+            payload={"reason": "worker_execution_error"}, entities=_task_entities(task, run),
+        )
+        publish_core_state(org_id, CoreState.WARNING, actor, str(task.id))
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to record recoverable state for task %s", task.id)
+        db.rollback()
 
 
 def main() -> None:

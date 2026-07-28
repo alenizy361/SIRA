@@ -80,6 +80,29 @@ def test_poll_tick_executes_ready_task_and_advances_state(db, org_id, monkeypatc
     assert task.state == "validating"
 
 
+def test_unexpected_run_error_lands_task_in_retry_wait_not_stuck_running(db, org_id, monkeypatch):
+    """Regression for the "task wedged in RUNNING forever" bug: any error from
+    start_run/wait other than AuthenticationRequiredError must leave the task
+    in a recoverable state and release its lease, never RUNNING."""
+    from app.models.work import RunLease
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    def _boom_start_run(self, contract, run_id=None, on_event=None):
+        raise FileNotFoundError("claude CLI not found on host")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _boom_start_run)
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    task = _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 0
+
+    db.refresh(task)
+    assert task.state == "retry_wait"
+    # Lease must be released so the task is reschedulable.
+    assert db.query(RunLease).filter(RunLease.task_id == task.id).count() == 0
+
+
 def test_poll_tick_skips_task_over_concurrency_ceiling(db, org_id, monkeypatch):
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 

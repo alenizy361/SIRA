@@ -24,7 +24,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ar" dir="rtl" className="h-full" suppressHydrationWarning>
-      <body className="min-h-full bg-slate-950 text-slate-100 antialiased" suppressHydrationWarning>
+      <body className="min-h-full text-slate-100 antialiased" suppressHydrationWarning>
+        {/* fixed cinematic deep-space backdrop behind everything */}
+        <div className="space-backdrop" aria-hidden />
         <QueryProvider>
           <I18nProvider>
             <ToastProvider>

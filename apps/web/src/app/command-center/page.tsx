@@ -8,7 +8,7 @@ import { useToast } from "@/components/ToastProvider";
 import { AgentOrbit } from "@/components/AgentOrbit";
 import { VoiceCapture } from "@/components/VoiceCapture";
 import { SpeakButton } from "@/components/SpeakButton";
-import { TransmissionsFeed } from "@/components/TransmissionsFeed";
+import { ConversationStream } from "@/components/ConversationStream";
 import { useEventStore } from "@/store/eventStore";
 import {
   agentsApi,
@@ -21,7 +21,7 @@ import {
 } from "@/lib/api";
 
 export default function CommandCenterPage() {
-  const { t, locale } = useI18n();
+  const { t } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const [goalTitle, setGoalTitle] = useState("");
@@ -49,8 +49,6 @@ export default function CommandCenterPage() {
     onError: () => toast.show(t("common.error_generic"), "error"),
   });
 
-  // Kick off CEO-agent planning for the most recent goal that hasn't been
-  // planned yet - this is what makes the orbit come alive with real activity.
   const requestPlan = useMutation({
     mutationFn: (goalId: string) => goalsApi.requestPlan(goalId),
     onSuccess: () => {
@@ -93,12 +91,14 @@ export default function CommandCenterPage() {
   );
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-4">
-      {/* header strip */}
+    <div className="mx-auto flex max-w-[1600px] flex-col gap-4">
+      {/* HUD header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <h1 className="text-lg font-semibold tracking-tight">{t("command_center.title")}</h1>
-          <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs font-medium text-slate-300">
+          <h1 className="text-lg font-semibold tracking-tight sm:text-xl">
+            {t("command_center.title")}
+          </h1>
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs font-medium text-slate-200">
             {stateLabel}
           </span>
           <SpeakButton text={stateLabel} />
@@ -106,7 +106,7 @@ export default function CommandCenterPage() {
         <div className="flex items-center gap-2 text-xs">
           <span
             className={`inline-block h-2 w-2 rounded-full ${
-              wsStatus === "open" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+              wsStatus === "open" ? "bg-emerald-400 shadow-[0_0_8px_#34d399]" : "bg-amber-400 animate-pulse"
             }`}
             aria-hidden
           />
@@ -120,64 +120,67 @@ export default function CommandCenterPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
-        {/* the living orbit - the hero */}
-        <div className="lg:col-span-3">
-          <AgentOrbit agents={agents} coreState={coreState} />
-        </div>
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+        {/* Core stage + console */}
+        <div className="flex flex-col gap-4 xl:col-span-7">
+          <div className="relative">
+            <AgentOrbit agents={agents} coreState={coreState} />
+          </div>
 
-        {/* command console + live transmissions */}
-        <div className="flex flex-col gap-4 lg:col-span-2">
           {/* command console */}
-          <div className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+          <div className="glass flex flex-col gap-3 rounded-2xl p-4">
             <form onSubmit={handleCreateGoal} className="flex flex-col gap-2">
               <label className="text-sm font-medium text-slate-300">
                 {t("command_center.goal_input_label")}
               </label>
-              <textarea
-                value={goalTitle}
-                onChange={(e) => setGoalTitle(e.target.value)}
-                placeholder={t("command_center.goal_input_placeholder")}
-                rows={2}
-                className="rounded-lg border border-white/10 bg-slate-900 p-3 text-sm outline-none focus:border-emerald-400/40"
-              />
-              <button
-                type="submit"
-                disabled={createGoal.isPending || !goalTitle.trim()}
-                className="min-h-[44px] rounded-lg bg-emerald-500 text-sm font-semibold text-slate-950 transition-opacity disabled:opacity-40"
-              >
-                {t("command_center.create_goal")}
-              </button>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <textarea
+                  value={goalTitle}
+                  onChange={(e) => setGoalTitle(e.target.value)}
+                  placeholder={t("command_center.goal_input_placeholder")}
+                  rows={1}
+                  className="min-h-[44px] flex-1 rounded-lg border border-white/10 bg-slate-900/60 p-3 text-sm outline-none focus:border-emerald-400/40"
+                />
+                <button
+                  type="submit"
+                  disabled={createGoal.isPending || !goalTitle.trim()}
+                  className="min-h-[44px] rounded-lg bg-emerald-500 px-5 text-sm font-semibold text-slate-950 transition-opacity disabled:opacity-40"
+                >
+                  {t("command_center.create_goal")}
+                </button>
+              </div>
             </form>
 
-            <VoiceCapture onConfirmed={(text) => setGoalTitle(text)} />
-
-            {/* plan trigger - only when there is a captured goal awaiting a plan */}
-            {capturedGoal ? (
-              <button
-                type="button"
-                onClick={() => requestPlan.mutate(capturedGoal.id)}
-                disabled={requestPlan.isPending}
-                className="min-h-[44px] rounded-lg border border-violet-400/40 bg-violet-500/10 text-sm font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:opacity-40"
-              >
-                {t("command_center.request_plan")}
-                <span className="block truncate text-[11px] font-normal text-violet-300/70">
-                  {capturedGoal.title}
-                </span>
-              </button>
-            ) : null}
-          </div>
-
-          {/* live transmissions */}
-          <div className="flex flex-1 flex-col rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-            <div className="mb-2 flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-slate-300">
-                {t("command_center.transmissions")}
-              </h2>
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" aria-hidden />
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
+              <div className="flex-1">
+                <VoiceCapture onConfirmed={(text) => setGoalTitle(text)} />
+              </div>
+              {capturedGoal ? (
+                <button
+                  type="button"
+                  onClick={() => requestPlan.mutate(capturedGoal.id)}
+                  disabled={requestPlan.isPending}
+                  className="min-h-[44px] rounded-lg border border-violet-400/40 bg-violet-500/10 px-4 text-sm font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:opacity-40"
+                >
+                  {t("command_center.request_plan")}
+                  <span className="block max-w-[26ch] truncate text-[11px] font-normal text-violet-300/70">
+                    {capturedGoal.title}
+                  </span>
+                </button>
+              ) : null}
             </div>
-            <TransmissionsFeed agents={agents} />
           </div>
+        </div>
+
+        {/* Live conversation */}
+        <div className="glass flex min-h-[28rem] flex-col rounded-2xl p-4 xl:col-span-5 xl:h-auto">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-200">
+              {t("command_center.conversation")}
+            </h2>
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee]" aria-hidden />
+          </div>
+          <ConversationStream agents={agents} />
         </div>
       </div>
 
@@ -185,7 +188,7 @@ export default function CommandCenterPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Link
           href="/approvals"
-          className="flex flex-col gap-1 rounded-2xl border border-white/10 bg-white/[0.03] p-4 hover:bg-white/[0.05]"
+          className="glass flex flex-col gap-1 rounded-2xl p-4 transition-colors hover:bg-white/[0.05]"
         >
           <span className="text-xs font-medium text-slate-400">
             {t("command_center.pending_approvals")}
@@ -196,7 +199,7 @@ export default function CommandCenterPage() {
           <span className="text-xs text-emerald-300">{t("command_center.view_all")} →</span>
         </Link>
 
-        <div className="flex flex-col gap-2 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+        <div className="glass flex flex-col gap-2 rounded-2xl p-4">
           <span className="text-xs font-medium text-slate-400">
             {t("command_center.system_health")}
           </span>

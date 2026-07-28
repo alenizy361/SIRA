@@ -116,12 +116,14 @@ export interface Approval {
 export interface AuditLogEntry {
   id: string;
   actor_type: string;
-  actor_id: string;
+  // Nullable in the DB (e.g. the emergency-stop audit row omits actor/entity),
+  // so the type must admit null - the UI guards against it.
+  actor_id: string | null;
   action: string;
-  entity_type: string;
-  entity_id: string;
+  entity_type: string | null;
+  entity_id: string | null;
   result: string;
-  explanation: string;
+  explanation: string | null;
   created_at: string;
 }
 

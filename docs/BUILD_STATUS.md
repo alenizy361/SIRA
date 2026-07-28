@@ -27,6 +27,92 @@ earlier "no Docker daemon" caveat. The remaining untested-here item is the
 `scripts/install.sh` run itself against a real Ubuntu VPS (systemd, nginx
 reload, certbot), which needs a real server.
 
+## Cinematic redesign + adversarial bug-audit pass (2026-07-28, latest)
+
+Two things happened in this pass: the command center was rebuilt to be
+genuinely cinematic with a live "watch them think and talk" view, and a
+12-agent adversarial audit (6 finders × 6 verifiers, opus) swept the repo
+for real defects. Every fix below was applied and the backend suite re-run
+green (102 passed, 1 real-Claude e2e verified separately).
+
+**UI**
+- `AICore.tsx` rebuilt as a layered WebGL energy core (glow halo, luminous
+  core, wireframe shell, energy ring, two particle shells) that reacts to
+  live event `energy`; tuned down from a blown-out white square.
+- New `ConversationStream.tsx`: renders each realtime event as a chat
+  message from the acting agent (decision summaries, tool activity, outputs
+  — never raw chain-of-thought), with a live "thinking" indicator.
+- `command-center/page.tsx` recomposed (core stage + console + live
+  conversation), plus a fixed CSS deep-space backdrop and glass panels.
+
+**Backend/worker/orchestrator defects fixed (found by the audit, verified
+against the code):**
+- `cli_adapter.py`: the wall-clock timeout used a blocking `readline()` that
+  a silent/hung run would ignore, and stderr was never drained (pipe-buffer
+  deadlock). Now stdout/stderr are pumped by daemon threads and the deadline
+  is enforced via a queue. The parser also returned on the first content
+  block, dropping sibling `tool_use` events — now emits all blocks. Tool
+  RESULTS and tool-input values are now scrubbed for secret shapes (were
+  broadcast/replayed unredacted).
+- `worker.py`: any non-auth error left a task wedged in `RUNNING` forever;
+  now lands it in `RETRY_WAIT`/`FAILED`. Planning claim made atomic
+  (`SELECT … FOR UPDATE`), and a malformed CEO response no longer strands a
+  goal at `plan_status='running'`.
+- `progression.py` (new): `RETRY_WAIT → READY` on backoff (or `→ FAILED`
+  when exhausted) and dead-dependency → `CANCELLED`. Wired into the poll
+  tick together with `expire_stale_leases`, so a transient failure or a
+  crashed worker no longer strands tasks. `scheduler.pick_ready_tasks` now
+  ignores expired leases.
+- `leasing.py`: the acquire race now translates the unique-violation into
+  `LeaseNotAcquired` instead of aborting the tick.
+- `planning.py`: guards non-dict JSON / missing `plan_title`/`summary`.
+
+**API/security defects fixed:**
+- Session tokens now use a fast SHA-256 digest (Argon2 was running on every
+  authenticated request — a self-inflicted DoS); Argon2 kept for passwords.
+- `/audit-logs?limit=<neg>` no longer 500s (`Query(ge=1, le=500)`).
+- `/ws` now checks `is_active`, subscribes before replay (no missed-event
+  gap, dedup by sequence), and uses a dedicated executor so it can't starve
+  the shared thread pool.
+- Lockout counter resets after the window lapses (a single late wrong
+  password no longer re-locks for a full window).
+- Emergency-stop audit row now carries entity fields.
+
+**Frontend defects fixed:**
+- Audit page no longer crashes on a null `entity_id` (the emergency-stop
+  row); WS client now force-reconnects a half-open (stale) socket; the live
+  core state is preserved across a transient reconnect instead of being
+  wiped to "idle".
+
+**Deployment/infra defects fixed (these were the real "can't run the agents
+on the VPS" blockers):**
+- `install.sh` `generate_env` replaced the whole `DATABASE_URL` with a bare
+  hex string → the host worker crash-looped on an unparseable URL. Now the
+  `CHANGE_ME` token is substituted in place and one DB password is reused so
+  `DATABASE_URL` and `POSTGRES_PASSWORD` match (verified: URL parses,
+  passwords match, session key distinct).
+- `docker-compose.yml` only `expose`d Postgres/Redis (compose-network only),
+  so the host worker couldn't reach `localhost:5432/6379` and the pipeline
+  never advanced. Now published to **loopback only** (`127.0.0.1:5432/6379`).
+- `install.sh` left Ubuntu's stock nginx default site enabled while marking
+  our config `default_server` → duplicate-`default_server` → `nginx -t`
+  failed and aborted the install. Now removes the stock default site.
+- `smoke-test.sh` required an exact `200` on `/`, but the web root
+  `307`-redirects to `/command-center`, so every deploy "failed" and every
+  upgrade auto-rolled-back. The web-root check now accepts 2xx/3xx.
+- `api.Dockerfile` now runs as a non-root user (matches what the systemd
+  unit already documents). NOTE: the api image could not be rebuilt in this
+  sandbox on this pass (the build's `pip install` can't reach pypi through
+  the sandbox proxy's self-signed CA — an environment limit, unrelated to
+  the one-line USER change); it must be rebuilt on the VPS via `install.sh`.
+
+Known-but-not-changed (deliberate): RBAC (`require_permission`) is defined
+but not enforced on routes — the only account today is the bootstrap admin,
+who is assigned no role, so gating routes would lock out the sole user.
+Documented rather than half-enforced. The `VALIDATING → … → COMPLETED`
+goal-completion tail still needs the reviewer-agent wiring (a feature, not a
+crash) and is left for a follow-up.
+
 ## What is DONE and verified
 
 - **Monorepo scaffold** matching constitution section 4 exactly.

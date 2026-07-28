@@ -37,11 +37,11 @@ export default function AuditPage() {
                     {new Date(row.created_at).toLocaleString()}
                   </td>
                   <td className="px-3 py-2 text-xs text-slate-400">
-                    {row.actor_type}:{row.actor_id.slice(0, 8)}
+                    {row.actor_type}:{(row.actor_id ?? "").slice(0, 8)}
                   </td>
                   <td className="px-3 py-2 font-medium text-slate-200">{row.action}</td>
                   <td className="px-3 py-2 text-xs text-slate-400">
-                    {row.entity_type}:{row.entity_id.slice(0, 8)}
+                    {row.entity_type ?? "—"}:{(row.entity_id ?? "").slice(0, 8)}
                   </td>
                   <td className="px-3 py-2">
                     <span

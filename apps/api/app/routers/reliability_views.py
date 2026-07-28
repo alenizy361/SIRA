@@ -134,6 +134,8 @@ def emergency_stop(user: User = Depends(get_current_user), db: DbSession = Depen
             actor_type="user",
             actor_id=str(user.id),
             action="system.emergency_stop",
+            entity_type="organization",
+            entity_id=str(user.organization_id),
             result="executed",
             explanation=f"Autonomy mode set to observe_only; {revoked} run lease(s) revoked.",
             created_at=datetime.now(timezone.utc),

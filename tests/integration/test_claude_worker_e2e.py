@@ -13,6 +13,7 @@ so the rest of the suite stays runnable anywhere.
 """
 import json
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -104,8 +105,11 @@ def test_real_task_fixes_failing_test_in_isolated_worktree():
         "as an uncommitted worktree diff that a later cleanup step would discard"
     )
 
+    # Verify with the SAME interpreter running this suite (sys.executable),
+    # not a bare "python3" which may resolve to an interpreter without pytest
+    # installed - the fix's correctness must not hinge on PATH resolution.
     verify = subprocess.run(
-        ["python3", "-m", "pytest", "tests/test_step3.py", "-q"],
+        [sys.executable, "-m", "pytest", "tests/test_step3.py", "-q"],
         cwd=result.workspace_path,
         capture_output=True,
         text=True,

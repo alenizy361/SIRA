@@ -6,6 +6,7 @@ small enough that clarity beats a marginal performance gain here.
 """
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 _API_ROOT = Path(__file__).resolve().parents[2] / "apps" / "api"
@@ -61,7 +62,13 @@ def pick_ready_tasks(
         .all()
     )
 
-    leased_task_ids = {row[0] for row in db.query(RunLease.task_id).all()}
+    # Only LIVE leases block scheduling. An expired lease (its worker crashed
+    # without releasing) must NOT keep its task out of the queue forever - it
+    # is reclaimed by expire_stale_leases / acquire_lease's reclaim path.
+    now = datetime.now(timezone.utc)
+    leased_task_ids = {
+        row[0] for row in db.query(RunLease.task_id).filter(RunLease.expires_at > now).all()
+    }
     picked: list[Task] = []
     running_count_by_agent: dict[str, int] = {}
 
