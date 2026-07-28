@@ -2,6 +2,35 @@
 
 Format: date, decision, rationale. Newest first.
 
+## 2026-07-28 — Dependency versions bumped after a real vulnerability scan
+
+**Decision:** `apps/api/requirements.txt`: removed `python-jose` (and its
+transitive `ecdsa`/`pyasn1`/`rsa`) entirely - it was included speculatively
+for JWT support but never actually used once server-side revocable
+sessions were chosen instead; bumped `fastapi` 0.115.6 → 0.140.7 (pulls a
+patched `starlette` 1.3.1 automatically) and `python-multipart` 0.0.20 →
+0.0.32.
+
+**Rationale:** `pip-audit` found 21 known CVEs across exactly those three
+packages. Removing an unused dependency is strictly better than pinning a
+"fixed" version of something that shouldn't be there at all. Re-ran
+`pip-audit` (0 findings) and the full test suite (73/73 passing) after the
+upgrade before committing it.
+
+## 2026-07-28 — CEO-agent planning is a real synchronous Claude CLI call, not a template
+
+**Decision:** `POST /goals/{id}/plan` (`apps/api/app/services/planning.py`)
+shells out to the real `claude` CLI with `--json-schema` and a CEO-agent
+prompt, parses the structured JSON result, and persists a real Plan/Task
+graph - rather than a canned/templated plan generator.
+
+**Rationale:** Constitution rule #1 ("no placeholder business logic") and
+the product vision explicitly describe the CEO agent converting goals
+into plans via genuine reasoning. A template would violate both. Kept
+synchronous (not queued) because a single planning call is short (no code
+tools involved, small timeout) - background execution is reserved for
+actual code-writing tasks via `services/claude-worker`'s poll loop.
+
 ## 2026-07-28 — Environment reality check before build
 
 **Decision:** Build the full monorepo, migrations, and real (non-Docker) local

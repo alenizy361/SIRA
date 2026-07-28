@@ -121,14 +121,56 @@ with `uvicorn` and exercised over real HTTP with `curl`.
   test: `tests/integration/test_worker_poll.py::test_emergency_stop_autonomy_mode_blocks_new_task_assignment`.
   73 automated tests pass total now.
 
-## In progress
+- **`apps/web`**: Next.js 16 (App Router, Turbopack) + TypeScript + Tailwind
+  v4 command center, 20 routes. Independently re-verified (not just taking
+  the building agent's word for it): `npm run build` passes with zero
+  errors; started the production build for real and confirmed via
+  Playwright (Chromium, 390x844 iPhone viewport) that: unauthenticated
+  visits correctly redirect to `/login`; logging in with the real admin
+  account and navigating to `/command-center` renders an actual live WebGL
+  `<canvas>` (React Three Fiber AI core, not an image) with zero layout
+  overflow (`scrollWidth === clientWidth`); `/agents` shows all 23 real
+  agents with correct bilingual names, risk badges, and accurate
+  enabled/disabled state (double-checked via raw DOM text after initially
+  misreading a screenshot - CEO/CTO/Backend Engineer correctly show
+  "مفعّل"/enabled, Analytics correctly shows "معطّل"/disabled with its real
+  `disabled_reason`); `/goals` shows the real goal + its real
+  `plan_drafted` state from the CEO-planning demo above; `/approvals`
+  correctly shows an honest empty state. Arabic-first RTL with instant
+  EN switching works. Voice capture uses the browser SpeechRecognition API
+  with a transcript-confirmation step (no auto-submit), per spec.
+  **Honest gap vs. the spec's "premium space-station" visual language**:
+  the built UI is a clean, functional dark dashboard with a genuine
+  reactive 3D sphere - it is not the full cinematic treatment (particle
+  shell/neural arcs/waveform ring) described in constitution section 13.
+  It is real and functional, not a mockup, but visually simpler than the
+  aspirational description.
+  Known incomplete pieces (all show honest "not available yet" empty
+  states rather than fake data): `/runs` and `/analytics` have no backend
+  endpoint yet; `core.state.changed` events aren't published by the
+  backend yet (see gap #2 below) so the sphere doesn't yet animate from
+  live agent activity, only from its own idle-state logic.
 
-- **`apps/web`**: Next.js command center - delegated to a background agent
-  with the real, already-running API contract. Check this file's next
-  revision (or `git log`) for what landed: which of the 16 required pages
-  are fully wired to real endpoints vs. gracefully degraded pending a
-  backend endpoint that doesn't exist yet (plans/tasks have list endpoints
-  but no create/assign UI wiring yet).
+## Dependency security scan
+
+Ran `pip-audit` against `apps/api/requirements.txt`: found 21 known CVEs
+across `python-jose` (unused - removed entirely, along with its vulnerable
+transitive `ecdsa`/`pyasn1`/`rsa` deps, since we use server-side sessions
+not JWT), `python-multipart` (bumped 0.0.20 → 0.0.32), and `starlette`
+(fixed by bumping `fastapi` 0.115.6 → 0.140.7, which pulls a patched
+starlette 1.3.1 automatically). Re-ran `pip-audit`: **0 known
+vulnerabilities**. Re-ran the full test suite after the upgrade: all 73
+tests still pass.
+
+Ran `npm audit` on `apps/web`: 3 high-severity findings, all in Next.js's
+own bundled build-time dependencies (`postcss`, `sharp`), whose only fix
+path is downgrading to `next@9.3.x` (a 6-major-version regression that
+would break the entire app). These are build/image-processing-tool CVEs
+(CSS stringify XSS, libvips image CVEs) that don't correspond to an
+exploitable path in how this app uses Next.js (no untrusted image uploads
+processed through `sharp`, no attacker-controlled CSS compiled at
+runtime). Documented here rather than silently ignored; revisit when Next
+ships a patched release on the current major version.
 
 ## Known gaps / honest limitations (not yet done)
 
@@ -180,15 +222,16 @@ with `uvicorn` and exercised over real HTTP with `curl`.
 
 ## Exact next actions (in priority order)
 
-1. Read the frontend agent's report once it lands, verify `npm run build`
-   actually passed, spot-check 2-3 pages manually.
-2. Wire `POST /goals` → CEO-agent planning: on goal creation, synchronously
-   or via the orchestrator, create a `Plan` + `Task` row so the dashboard
-   has something real to show beyond an empty list.
-3. Wire `run.output.delta` / `core.state.changed` events from
+1. Wire `run.output.delta` / `core.state.changed` events from
    `services/claude-worker` into `apps/api/app/realtime/bus.py` so the 3D
-   core has real data to react to.
-4. Write `tests/security/test_prompt_injection.py` exercising the
-   claude-worker's untrusted-context handling against adversarial input.
+   core reacts to real agent activity instead of only its own idle state.
+2. Wire the permission engine into the API/worker execution path: no route
+   or worker task currently calls `PermissionEngine.evaluate()` before
+   executing a mutating action - `packages/permission-engine` is real and
+   tested in isolation but not yet consulted at the point of execution.
+3. Add `GET/POST /runs` and `GET /analytics` endpoints so those two
+   dashboard pages stop showing "not available yet".
+4. Add `tests/load/` (currently empty) - basic WebSocket connection-count
+   and event-throughput tests.
 5. When a real VPS becomes available: run `scripts/doctor.sh` first, then
    `scripts/install.sh`, then re-run `scripts/smoke-test.sh`.
