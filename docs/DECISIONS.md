@@ -1,0 +1,60 @@
+# Architecture Decisions — Rabit AI Company OS
+
+Format: date, decision, rationale. Newest first.
+
+## 2026-07-28 — Environment reality check before build
+
+**Decision:** Build the full monorepo, migrations, and real (non-Docker) local
+integration tests inside this sandbox; do not fabricate a "live VPS install."
+
+**Rationale:** Repository inspection showed `alenizy361/SIRA` was a blank
+single-commit repo (no existing `autonomous-company-os` install to migrate),
+and the execution environment is an ephemeral container with no systemd PID 1,
+no running Docker daemon, and no independently-authenticated `aicompany` OS
+user for a separate Claude Max CLI session. Per the constitution's own rule
+("every completion claim must include evidence" / "do not claim a feature is
+finished if simulated or untested"), we do not simulate a production install.
+Confirmed with the user (2026-07-28): build code in-repo, defer live
+deployment to a session with real VPS/SSH access. See `docs/BUILD_STATUS.md`
+for exactly what has been executed/tested in this sandbox vs. what still
+requires a real server.
+
+## 2026-07-28 — No Kubernetes/Temporal; DB-backed state machine + Redis queue
+
+**Decision:** Use PostgreSQL as the durable orchestration state store and
+Redis for queues/leases/pub-sub, with a hand-rolled state machine in
+`services/orchestrator`. No Temporal, no Kubernetes.
+
+**Rationale:** Constitution section 4 explicitly asks for this on a
+single-VPS first release, with clean interfaces for a future swap.
+
+## 2026-07-28 — Claude worker talks to the real `claude` CLI via subprocess
+
+**Decision:** `services/claude-worker` shells out to the locally authenticated
+`claude` CLI (found at `/opt/node22/bin/claude`, v2.1.220) rather than the
+Anthropic API, per the no-API-key constraint. Streaming is attempted via
+`--output-format stream-json`; a line-buffered text fallback is implemented
+for older/incompatible CLI builds. Verified CLI flags empirically with
+`claude --help` before wiring the adapter (see BUILD_STATUS for the exact
+flag set discovered on this box).
+
+## 2026-07-28 — Currency/timezone/locale defaults
+
+**Decision:** SAR is the operating currency, Asia/Riyadh the default
+timezone, Arabic is the first-class default UI locale with instant EN
+switching, per constitution sections 2/3.
+
+## 2026-07-28 — Postgres/Redis run natively in this sandbox, not via Docker
+
+**Decision:** For local dev/test in this container we start
+`postgres` (already apt-installed, v16) and `redis-server` directly as
+foreground/background processes rather than through `docker-compose`,
+since no Docker daemon is reachable here. `docker-compose.yml` is still the
+authoritative production deployment definition for a real VPS with Docker.
+
+## 2026-07-28 — Monorepo layout matches constitution section 4 verbatim
+
+**Decision:** Directory layout under `/home/user/SIRA` mirrors the spec's
+tree exactly (apps/, services/, packages/, constitution/, infra/, scripts/,
+tests/, workspace/, docs/) so future contributors can navigate by the same
+mental model as the constitution documents.

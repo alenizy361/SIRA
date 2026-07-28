@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rabit.ai/schemas/agent-spec.json",
+  "title": "Rabit AI Company OS Agent Specification",
+  "description": "Machine-readable contract for a single agent definition, validated at API startup by apps/api/app/agents/loader.py",
+  "type": "object",
+  "required": [
+    "id", "display_name", "mission", "scope", "inputs", "required_context",
+    "allowed_tools", "denied_tools", "allowed_actions", "forbidden_actions",
+    "risk_ceiling", "budget_ceiling", "concurrency_ceiling", "required_outputs",
+    "required_evidence", "quality_checks", "escalation_conditions",
+    "stop_conditions", "kpis", "memory_policy", "communication_protocol",
+    "review_requirements", "enabled"
+  ],
+  "properties": {
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "display_name": {
+      "type": "object",
+      "required": ["en", "ar"],
+      "properties": {"en": {"type": "string"}, "ar": {"type": "string"}}
+    },
+    "mission": {"type": "string"},
+    "scope": {"type": "string"},
+    "inputs": {"type": "array", "items": {"type": "string"}},
+    "required_context": {"type": "array", "items": {"type": "string"}},
+    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+    "denied_tools": {"type": "array", "items": {"type": "string"}},
+    "allowed_actions": {"type": "array", "items": {"type": "string"}},
+    "forbidden_actions": {"type": "array", "items": {"type": "string"}},
+    "risk_ceiling": {"type": "string", "enum": ["R0", "R1", "R2", "R3", "R4"]},
+    "budget_ceiling": {
+      "type": "object",
+      "properties": {
+        "currency": {"type": "string", "const": "SAR"},
+        "daily_max": {"type": "number", "minimum": 0},
+        "monthly_max": {"type": "number", "minimum": 0}
+      }
+    },
+    "concurrency_ceiling": {"type": "integer", "minimum": 0},
+    "required_outputs": {"type": "array", "items": {"type": "string"}},
+    "required_evidence": {"type": "array", "items": {"type": "string"}},
+    "quality_checks": {"type": "array", "items": {"type": "string"}},
+    "escalation_conditions": {"type": "array", "items": {"type": "string"}},
+    "stop_conditions": {"type": "array", "items": {"type": "string"}},
+    "kpis": {"type": "array", "items": {"type": "string"}},
+    "memory_policy": {
+      "type": "object",
+      "required": ["read", "write"],
+      "properties": {
+        "read": {"type": "array", "items": {"type": "string"}},
+        "write": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "communication_protocol": {"type": "string"},
+    "review_requirements": {"type": "string"},
+    "enabled": {"type": "boolean"},
+    "disabled_reason": {"type": "string"}
+  }
+}
