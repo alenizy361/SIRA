@@ -1,0 +1,63 @@
+# infra/systemd/rabit-api.service
+#
+# Thin systemd wrapper around `docker compose up api` for the FastAPI
+# control plane (apps/api, port 8000). Docker Compose remains the primary
+# deployment mechanism (see docker-compose.yml at repo root) — this unit
+# just gives it a standard systemd lifecycle (boot-start, auto-restart,
+# `systemctl status`/`journalctl` integration) alongside rabit-web.service
+# and rabit-claude-worker.service.
+#
+# ASSUMPTIONS to verify against the real docker-compose.yml:
+#   - APP_ROOT is /opt/rabit-ai-company-os (installed there by scripts/install.sh)
+#   - the compose service is named exactly "api" and depends on "postgres"/"redis"
+#     already being healthy (enforced via `depends_on: condition: service_healthy`
+#     in docker-compose.yml, not repeated here)
+#
+# User=root is used deliberately, not because the API process itself needs
+# root (its Dockerfile should USER a non-root uid inside the container) but
+# because this unit's only job is to talk to /var/run/docker.sock, which on
+# a stock Ubuntu host requires root or docker-group membership — and
+# docker-group membership is root-equivalent (bind-mount access), so it is
+# not actually "more non-root" than this. Do not run the app code itself as
+# root; that is enforced in the Dockerfile, not here.
+[Unit]
+Description=Rabit AI Company OS - API (FastAPI control plane via Docker Compose)
+Documentation=file:///opt/rabit-ai-company-os/docs/SPEC_SOURCE.md
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rabit-ai-company-os
+Environment=COMPOSE_FILE=/opt/rabit-ai-company-os/docker-compose.yml
+
+# Ensure the dependencies this service needs are up before we attach to
+# "api"'s logs; docker-compose.yml's own depends_on/healthcheck settings are
+# the real gate, this is just belt-and-suspenders idempotent bring-up.
+ExecStartPre=/usr/bin/docker compose -f /opt/rabit-ai-company-os/docker-compose.yml up -d postgres redis
+ExecStart=/usr/bin/docker compose -f /opt/rabit-ai-company-os/docker-compose.yml up api
+ExecStop=/usr/bin/docker compose -f /opt/rabit-ai-company-os/docker-compose.yml stop api
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Hardening (this unit only shells out to the docker CLI; it does not need
+# broad filesystem or privilege access beyond the docker socket).
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+
+# Resource ceiling for the wrapper process tree itself. The container's own
+# resource limits belong in docker-compose.yml (deploy.resources), not here.
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

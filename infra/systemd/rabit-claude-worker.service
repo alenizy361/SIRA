@@ -1,0 +1,64 @@
+# infra/systemd/rabit-claude-worker.service
+#
+# services/claude-worker runs directly on the host (NOT in Docker) as the
+# dedicated non-root "aicompany" OS user, because it shells out to the
+# locally authenticated `claude` CLI, whose login/session state
+# (~aicompany/.claude, credential cache, etc.) is per-OS-user. It talks to
+# the API only over a strictly localhost-only authenticated interface —
+# it must never be exposed on a public interface.
+#
+# MANUAL PREREQUISITE (never automated — see scripts/install.sh output):
+#   sudo -u aicompany -H claude auth login
+# This unit will crash-loop (bounded by StartLimitBurst below) until that
+# has been done at least once; that is expected and is not a bug.
+#
+# ASSUMPTIONS to verify against the real services/claude-worker once built:
+#   - Entrypoint is an executable `run.sh` at the service root that this
+#     unit simply invokes (keeps this unit decoupled from whatever language
+#     runtime/venv the worker ends up using). Adjust ExecStart if the real
+#     entrypoint differs (e.g. a venv'd `python -m claude_worker`).
+#   - WorkingDirectory is the aicompany-owned workspace under APP_ROOT
+#     (created + chowned by scripts/install.sh) where the worker checks out
+#     task branches/worktrees per docs/SPEC_SOURCE.md section 3 ("every code
+#     change in isolated branch/worktree").
+[Unit]
+Description=Rabit AI Company OS - Claude Worker (runs as aicompany, uses local `claude` CLI session)
+Documentation=file:///opt/rabit-ai-company-os/docs/SPEC_SOURCE.md
+After=network-online.target rabit-api.service
+Wants=network-online.target
+# Intentionally NOT `Requires=docker.service` — this process is not
+# containerized.
+
+[Service]
+Type=simple
+User=aicompany
+Group=aicompany
+WorkingDirectory=/opt/rabit-ai-company-os/workspace
+
+Environment=HOME=/home/aicompany
+Environment=RABIT_API_URL=http://127.0.0.1:8000
+EnvironmentFile=-/opt/rabit-ai-company-os/.env
+
+ExecStart=/opt/rabit-ai-company-os/services/claude-worker/run.sh
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Hardening: this process only needs its own workspace, the aicompany home
+# (for the claude CLI's auth/session state), and outbound + localhost
+# network access to the API. It must never need root.
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/opt/rabit-ai-company-os/workspace /home/aicompany
+PrivateTmp=true
+
+# Resource ceiling — a runaway agent loop should hit this, not the whole
+# VPS. Tune per available host resources (scripts/doctor.sh reports current
+# CPU/RAM so these can be sized sensibly for the real box).
+MemoryMax=2G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

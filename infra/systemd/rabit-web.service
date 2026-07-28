@@ -1,0 +1,45 @@
+# infra/systemd/rabit-web.service
+#
+# Thin systemd wrapper around `docker compose up web` for the Next.js
+# dashboard (apps/web, port 3000). See rabit-api.service for the rationale
+# on User=root (docker.sock access, not app-code privilege) and on Docker
+# Compose remaining the primary deployment definition.
+#
+# ASSUMPTIONS to verify against the real docker-compose.yml:
+#   - APP_ROOT is /opt/rabit-ai-company-os
+#   - the compose service is named exactly "web" and reaches the API at
+#     its compose-network address (not localhost) for server-side requests,
+#     while the browser talks to /api/ and /ws through Nginx.
+[Unit]
+Description=Rabit AI Company OS - Web (Next.js dashboard via Docker Compose)
+Documentation=file:///opt/rabit-ai-company-os/docs/SPEC_SOURCE.md
+After=docker.service network-online.target rabit-api.service
+Wants=network-online.target
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rabit-ai-company-os
+Environment=COMPOSE_FILE=/opt/rabit-ai-company-os/docker-compose.yml
+
+ExecStart=/usr/bin/docker compose -f /opt/rabit-ai-company-os/docker-compose.yml up web
+ExecStop=/usr/bin/docker compose -f /opt/rabit-ai-company-os/docker-compose.yml stop web
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

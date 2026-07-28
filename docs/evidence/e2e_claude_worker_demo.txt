@@ -1,0 +1,31 @@
+=== git log --all --oneline --graph ===
+* 2e47a2f Rabit agent task e2e-bb4dd688: automated commit of worker changes
+* 6565cc0 Add package __init__ files for test discovery
+* c206e97 Initial sample CV builder funnel (intentionally has a failing test)
+
+=== git branch -a ===
+  agent/task-e2e-bb4dd688
+* master
+
+=== diff introduced by the real Claude Code CLI run (agent branch vs the commit before __init__.py housekeeping) ===
+commit 2e47a2f2143b837c442d2633e68839ed1a8bc3de
+Author: Rabit Claude Worker <claude-worker@rabit.local>
+Date:   Tue Jul 28 02:23:17 2026 +0000
+
+    Rabit agent task e2e-bb4dd688: automated commit of worker changes
+    
+    Run 27e549ec-e154-4d7b-b135-48d7153ea254 on branch agent/task-e2e-bb4dd688.
+
+diff --git a/src/funnel/step3.py b/src/funnel/step3.py
+index 8baccbc..ee7ad6b 100644
+--- a/src/funnel/step3.py
++++ b/src/funnel/step3.py
+@@ -3,7 +3,7 @@ def compute_next_step_label(current_step: int) -> str:
+     labels = {
+         1: "Start",
+         2: "Continue",
+-        3: "Continue",  # step 3 has an unusually high drop-off rate
++        3: "Almost there",  # step 3 has an unusually high drop-off rate
+         4: "Review",
+         5: "Download",
+     }

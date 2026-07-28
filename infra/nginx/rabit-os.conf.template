@@ -1,0 +1,147 @@
+# infra/nginx/rabit-os.conf.template
+#
+# Rabit AI Company OS — Nginx reverse proxy template.
+#
+# Rendered by scripts/install.sh via:
+#   DOMAIN=your.domain envsubst '${DOMAIN}' < rabit-os.conf.template > /etc/nginx/sites-available/rabit-os.conf
+#
+# ONLY the ${DOMAIN} placeholder is substituted — every other nginx `$variable`
+# below (e.g. $host, $remote_addr, $http_upgrade) is left alone on purpose and
+# must remain literal in the rendered file.
+#
+# SECURITY NOTE — READ BEFORE CHANGING:
+#   Postgres (5432) and Redis (6379) must NEVER be added to this file, never
+#   proxied, and never bound to a public interface anywhere in this stack.
+#   They are reached only over the docker-compose internal network / localhost
+#   by the api and worker processes. If you find yourself adding a `location`
+#   or `stream` block for either port, stop — that is a policy violation
+#   (see docs/SPEC_SOURCE.md section 3: "no secrets/services exposed beyond
+#   what's required").
+#
+# ASSUMPTIONS (verify against the real apps/api and apps/web once built):
+#   - Next.js (apps/web) listens on 127.0.0.1:3000
+#   - FastAPI (apps/api) listens on 127.0.0.1:8000 and serves its own routes
+#     at root (i.e. Nginx strips the /api/ prefix via the trailing slash on
+#     proxy_pass below — apps/api should NOT also expect a /api prefix
+#     internally)
+#   - The realtime dashboard WebSocket (packages/contracts/events.py) is
+#     served by the API process at /ws
+
+# --- gzip -------------------------------------------------------------
+gzip on;
+gzip_vary on;
+gzip_comp_level 5;
+gzip_min_length 256;
+gzip_proxied any;
+gzip_types
+    text/plain
+    text/css
+    text/xml
+    text/javascript
+    application/javascript
+    application/json
+    application/xml
+    application/xml+rss
+    application/vnd.api+json
+    image/svg+xml;
+
+# --- upstream definitions ----------------------------------------------
+upstream rabit_web_upstream {
+    server 127.0.0.1:3000;
+    keepalive 16;
+}
+
+upstream rabit_api_upstream {
+    server 127.0.0.1:8000;
+    keepalive 16;
+}
+
+# --- HTTP server ---------------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    # Let certbot's HTTP-01 challenge through even after TLS is enabled.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+    }
+
+    # ---- Security headers (applied to every response from this server) ----
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+    # Reasonable default CSP for a Next.js dashboard talking to its own API
+    # over same-origin /api/ and /ws. Tighten further once real asset/CDN
+    # origins are finalized; loosen 'unsafe-inline'/'unsafe-eval' only if a
+    # build actually requires it (Next.js dev mode does; prod usually doesn't).
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss://${DOMAIN} https://${DOMAIN}; frame-src 'none'" always;
+
+    # HSTS — leave commented out until a valid TLS certificate is confirmed
+    # working end-to-end (enabling this on plain HTTP will not add security
+    # and can lock out a domain that later fails to renew its cert).
+    # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    client_max_body_size 20m;
+
+    # ---- WebSocket: realtime dashboard event stream ----
+    location /ws {
+        proxy_pass http://rabit_api_upstream/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    # ---- API: FastAPI control plane ----
+    # Trailing slash on proxy_pass strips the /api/ prefix, so apps/api sees
+    # e.g. "/goals" for a request to "/api/goals". Adjust here (not in the
+    # app) if apps/api ends up expecting the /api prefix itself.
+    location /api/ {
+        proxy_pass http://rabit_api_upstream/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+
+    # ---- Web: Next.js dashboard ----
+    location / {
+        proxy_pass http://rabit_web_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+}
+
+# Required for the "Connection" header used by Next.js's own dev/HMR
+# websocket (separate from the /ws dashboard endpoint above).
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# --- HTTPS server (enable once certbot has provisioned a certificate) ------
+# scripts/install.sh runs `certbot --nginx -d ${DOMAIN}` when DOMAIN is set
+# and reachable, which rewrites this file in place to add the corresponding
+# `listen 443 ssl;` server block and certificate directives. No changes are
+# needed here for that to work — this template intentionally ships
+# HTTP-only and lets certbot manage the TLS block itself.
