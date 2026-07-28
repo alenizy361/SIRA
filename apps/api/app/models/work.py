@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -83,6 +83,11 @@ class Run(Base, OrgScopedMixin):
     branch_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     baseline_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The CLI's own reported spend for this run (its stream-json `result`
+    # message carries `total_cost_usd`) - real dollars, not an estimate. Null
+    # until the run finishes; a failed/timed-out run can still have incurred
+    # real cost, so this is set independently of run.state.
+    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
 
 
 class RunLease(Base):

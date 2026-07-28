@@ -1,9 +1,9 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useI18n } from "@/i18n/I18nProvider";
-import { goalsApi } from "@/lib/api";
+import { goalsApi, tasksApi } from "@/lib/api";
 import { agentMeta } from "@/lib/agentMeta";
 
 const RISK_COLOR: Record<string, string> = {
@@ -11,6 +11,18 @@ const RISK_COLOR: Record<string, string> = {
   R1: "#fbbf24",
   R2: "#fb7185",
 };
+
+// States a task can still be interrupted out of - mirrors TaskState's
+// non-terminal members (services/orchestrator/state_machine.py), so the
+// button only ever appears on a task that /tasks/{id}/cancel will accept.
+const CANCELLABLE_STATES = new Set([
+  "ready",
+  "assigned",
+  "running",
+  "retry_wait",
+  "blocked",
+  "human_input_required",
+]);
 
 /**
  * The readable "response" to a goal: the CEO's plan summary and the tasks it
@@ -30,6 +42,12 @@ export function GoalPlanPanel({
   showOpenLink?: boolean;
 }) {
   const { t, locale } = useI18n();
+  const queryClient = useQueryClient();
+
+  const cancelMutation = useMutation({
+    mutationFn: (taskId: string) => tasksApi.cancel(taskId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["goal-plan", goalId] }),
+  });
 
   const TERMINAL = ["completed", "cancelled", "failed", "incident_opened"];
   const planQuery = useQuery({
@@ -190,6 +208,21 @@ export function GoalPlanPanel({
                   <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-slate-400">
                     {task.state}
                   </span>
+                  {CANCELLABLE_STATES.has(task.state) ? (
+                    <button
+                      type="button"
+                      onClick={() => cancelMutation.mutate(task.id)}
+                      disabled={cancelMutation.isPending && cancelMutation.variables === task.id}
+                      className="ml-auto rounded-full border border-rose-400/30 bg-rose-500/[0.08] px-2 py-0.5 text-[10px] font-semibold text-rose-300 hover:bg-rose-500/20 disabled:opacity-50"
+                    >
+                      {cancelMutation.isPending && cancelMutation.variables === task.id
+                        ? t("command_center.cancelling_task")
+                        : t("command_center.cancel_task")}
+                    </button>
+                  ) : null}
+                  {cancelMutation.isError && cancelMutation.variables === task.id ? (
+                    <span className="text-[10px] text-rose-400">{t("command_center.task_cancel_failed")}</span>
+                  ) : null}
                 </div>
               </div>
             );

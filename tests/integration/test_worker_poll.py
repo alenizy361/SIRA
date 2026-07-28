@@ -13,7 +13,7 @@ class _FakeRunResult(SimpleNamespace):
     pass
 
 
-def _fake_start_run(self, contract, run_id=None, on_event=None):
+def _fake_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None):
     class _Handle:
         cancelled = False
 
@@ -26,6 +26,8 @@ def _fake_start_run(self, contract, run_id=None, on_event=None):
             run_id=run_id,
             exit_code=0,
             timed_out=False,
+            cancelled=False,
+            cost_usd=None,
             workspace_path="/tmp/fake",
             branch_name="agent/fake",
             baseline_commit="abc123",
@@ -92,7 +94,7 @@ def test_unexpected_run_error_lands_task_in_retry_wait_not_stuck_running(db, org
     from app.models.work import RunLease
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 
-    def _boom_start_run(self, contract, run_id=None, on_event=None):
+    def _boom_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None):
         raise FileNotFoundError("claude CLI not found on host")
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _boom_start_run)
@@ -315,3 +317,150 @@ def test_goal_stays_put_while_any_task_is_still_in_flight(db, org_id):
     assert advanced == 0
     db.refresh(goal)
     assert goal.state == "plan_drafted"
+
+
+def test_worker_stops_a_running_task_and_marks_it_cancelled_when_an_operator_requests_it(db, org_id, engine, monkeypatch):
+    """The point of the whole is_cancelled wiring: a Cancellation row written
+    via a SEPARATE DB connection (exactly what POST /tasks/{id}/cancel does
+    for a RUNNING task - work_views.cancel_task never touches task.state
+    itself for that case) must be visible to the worker's own poll and drive
+    the task to CANCELLED, not left running to its own timeout."""
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.models.identity import User
+    from app.models.work import Cancellation, Run
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    user = User(
+        organization_id=org_id, email=f"canceller-{_uuid.uuid4().hex[:8]}@rabit.sa",
+        password_hash="x", display_name="Canceller",
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    def _fake_start_run_honoring_cancel(self, contract, run_id=None, on_event=None, is_cancelled=None):
+        class _Handle:
+            cancelled = False
+
+            def cancel(self):
+                pass
+
+        def _wait():
+            # Simulate the operator's cancel request landing mid-run, via a
+            # connection independent of the worker's own `db` session.
+            session = OrmSession(bind=engine)
+            session.add(Cancellation(
+                task_id=_uuid.UUID(contract.task_id), requested_by=user.id,
+                created_at=datetime.now(timezone.utc),
+            ))
+            session.commit()
+            session.close()
+
+            assert is_cancelled() is True, "is_cancelled() must see the Cancellation row from the other session"
+
+            return _FakeRunResult(
+                task_id=contract.task_id, run_id=run_id, exit_code=None, timed_out=False,
+                cancelled=True, cost_usd=None, workspace_path="/tmp/fake",
+                branch_name="agent/fake", baseline_commit="abc123", final_commit=None,
+                result_summary="", changed_files=[],
+            )
+
+        return _Handle(), _wait
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run_honoring_cancel)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    task = _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 1
+
+    db.refresh(task)
+    assert task.state == "cancelled"
+    run = db.query(Run).filter(Run.task_id == task.id).one()
+    assert run.state == "cancelled"
+
+
+def test_task_is_blocked_without_invoking_the_cli_once_org_budget_is_exceeded(db, org_id, monkeypatch):
+    """Regression target: a Budget row existed in the schema with nothing
+    ever enforcing it - an org could burn unlimited real dollars through the
+    CLI subprocess. Once spend + reserved reaches monthly_max, the CLI must
+    never even be invoked for a new task."""
+    from app.models.integrations import Budget
+    from app.models.work import Run, RunLease
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    db.add(Budget(
+        organization_id=org_id, scope="org", scope_ref=str(org_id),
+        monthly_max=10, spent_amount=10,
+    ))
+    db.commit()
+
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None):
+        raise AssertionError("the CLI must not be invoked once the org is over budget")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    task = _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 0
+
+    db.refresh(task)
+    assert task.state == "retry_wait"
+    assert db.query(RunLease).filter(RunLease.task_id == task.id).count() == 0
+    run = db.query(Run).filter(Run.task_id == task.id).one()
+    assert run.state == "failed"
+
+
+def test_real_run_cost_is_committed_against_the_configured_budget(db, org_id, monkeypatch):
+    """The CLI's own reported total_cost_usd must land as real spend against
+    the org's Budget row - not just be discarded after the run finishes."""
+    from app.models.integrations import Budget, BudgetTransaction
+    from app.models.work import Run
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    budget = Budget(organization_id=org_id, scope="org", scope_ref=str(org_id), monthly_max=100, spent_amount=0)
+    db.add(budget)
+    db.commit()
+    db.refresh(budget)
+
+    def _fake_start_run_with_cost(self, contract, run_id=None, on_event=None, is_cancelled=None):
+        class _Handle:
+            cancelled = False
+
+            def cancel(self):
+                pass
+
+        def _wait():
+            return _FakeRunResult(
+                task_id=contract.task_id, run_id=run_id, exit_code=0, timed_out=False,
+                cancelled=False, cost_usd=2.5, workspace_path="/tmp/fake",
+                branch_name="agent/fake", baseline_commit="abc123", final_commit="def456",
+                result_summary="Done.", changed_files=[],
+            )
+
+        return _Handle(), _wait
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_start_run_with_cost)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    task = _make_ready_task(db, org_id)
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 1
+
+    db.refresh(task)
+    assert task.state == "completed"
+    run = db.query(Run).filter(Run.task_id == task.id).one()
+    assert float(run.cost_usd) == 2.5
+
+    db.refresh(budget)
+    assert float(budget.spent_amount) == 2.5
+    txn = db.query(BudgetTransaction).filter(BudgetTransaction.idempotency_key == f"run-cost-{run.id}").one()
+    assert float(txn.amount) == 2.5

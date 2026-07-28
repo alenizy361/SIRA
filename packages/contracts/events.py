@@ -26,6 +26,7 @@ class EventType(str, Enum):
     TASK_PROGRESS = "task.progress"
     TASK_BLOCKED = "task.blocked"
     TASK_COMPLETED = "task.completed"
+    TASK_CANCELLED = "task.cancelled"
     RUN_OUTPUT_DELTA = "run.output.delta"
     RUN_TOOL_STARTED = "run.tool.started"
     RUN_TOOL_COMPLETED = "run.tool.completed"

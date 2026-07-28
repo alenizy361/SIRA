@@ -396,3 +396,104 @@ def test_goal_plan_endpoint_surfaces_the_transparent_work_log(client):
     assert log[1]["tool_name"] == "Edit"
     assert log[0]["output_preview"] == "class Tokenizer: ..."
     assert log[0]["succeeded"] is True
+
+
+def _make_task_for_cancel(db, org_id, state, goal_id=None, plan_id=None):
+    import uuid as _uuid
+
+    from app.models.work import Task
+
+    task = Task(
+        organization_id=org_id, plan_id=plan_id, title="Cancel-test task",
+        description="d", assigned_agent_key="backend_engineer", risk_level="R1",
+        state=state, idempotency_key=f"cancel-test-{_uuid.uuid4()}", acceptance_criteria={},
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def test_cancel_endpoint_immediately_cancels_a_task_that_is_not_yet_running(client):
+    """READY/ASSIGNED/etc tasks have no in-flight subprocess for a worker to
+    interrupt, so cancel must take effect synchronously here rather than
+    leaving a Cancellation row an idle task will never itself check."""
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+    from app.models.work import Cancellation
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    task = _make_task_for_cancel(db, org_id, state="ready")
+    task_id = str(task.id)
+    db.close()
+
+    resp = client.post(f"/tasks/{task_id}/cancel", json={"reason": "no longer needed"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "cancelled"
+    assert body["cancellation_requested"] is True
+
+    db = SessionLocal()
+    from app.models.work import Task as TaskModel
+    refreshed = db.query(TaskModel).filter(TaskModel.id == task.id).one()
+    assert refreshed.state == "cancelled"
+    cancellation = db.query(Cancellation).filter(Cancellation.task_id == task.id).one()
+    assert cancellation.reason == "no longer needed"
+    db.close()
+
+
+def test_cancel_endpoint_records_a_cancellation_without_flipping_a_running_tasks_state_early(client):
+    """A RUNNING task has a real subprocess in flight - only the worker that
+    owns it can safely stop it (see claude_worker.worker._make_is_cancelled).
+    The API must record the request and leave task.state alone, never race
+    the worker's own transition."""
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+    from app.models.work import Cancellation, Run
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    task = _make_task_for_cancel(db, org_id, state="running")
+    run = Run(organization_id=org_id, task_id=task.id, agent_key="backend_engineer", state="running")
+    db.add(run)
+    db.commit()
+    task_id, run_id = str(task.id), str(run.id)
+    db.close()
+
+    resp = client.post(f"/tasks/{task_id}/cancel", json={})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "running"  # unchanged - the worker drives this, not the API
+    assert body["cancellation_requested"] is True
+
+    db = SessionLocal()
+    cancellation = db.query(Cancellation).filter(Cancellation.task_id == task.id).one()
+    assert str(cancellation.run_id) == run_id
+    db.close()
+
+
+def test_cancel_endpoint_rejects_an_already_terminal_task(client):
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    task = _make_task_for_cancel(db, org_id, state="completed")
+    task_id = str(task.id)
+    db.close()
+
+    resp = client.post(f"/tasks/{task_id}/cancel", json={})
+    assert resp.status_code == 409, resp.text

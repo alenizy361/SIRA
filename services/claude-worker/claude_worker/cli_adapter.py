@@ -88,6 +88,7 @@ class RunResult:
     raw_stdout_lines: int = 0
     stderr_tail: str = ""
     tool_calls: list[dict] = field(default_factory=list)
+    cost_usd: Optional[float] = None
     error: Optional[str] = None
 
 
@@ -263,11 +264,22 @@ class ClaudeCodeAdapter:
         task: TaskContract,
         run_id: str | None = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> tuple[RunHandle, Callable[[], RunResult]]:
         """Starts the CLI subprocess and returns (handle, wait_fn). Calling
         wait_fn() blocks (with the task's timeout) until the run finishes and
         returns the RunResult - split this way so a caller can hold the
-        handle for cancellation while awaiting completion elsewhere."""
+        handle for cancellation while awaiting completion elsewhere.
+
+        `is_cancelled`, if given, is polled (throttled to once/second, piggy-
+        backing on the loop's existing per-second timeout check - never on
+        every stdout line) and stops the subprocess mid-run the moment it
+        returns True - the same "interrupt a specific in-flight agent"
+        capability Anthropic's own Managed Agents API treats as a first-class
+        primitive (`user.interrupt` on a session thread), which this worker
+        had no equivalent of: previously, once a task's subprocess started,
+        nothing could stop it before its own timeout.
+        """
         run_id = run_id or str(uuid.uuid4())
         auth_status = self.check_auth()
         capabilities = self.detect_capabilities()
@@ -340,6 +352,7 @@ class ClaudeCodeAdapter:
             tool_calls: list[dict] = []
             result_summary = ""
             timed_out = False
+            cost_usd: Optional[float] = None
 
             # stdout is pumped by a background thread into a queue so the main
             # loop can honor the wall-clock deadline even when the CLI stalls
@@ -372,6 +385,7 @@ class ClaudeCodeAdapter:
             stderr_thread.start()
 
             deadline = started_at + task.timeout_seconds
+            last_cancel_check = 0.0
             try:
                 while True:
                     remaining = deadline - time.time()
@@ -379,6 +393,12 @@ class ClaudeCodeAdapter:
                         timed_out = True
                         handle.cancel()
                         break
+                    now = time.time()
+                    if is_cancelled is not None and now - last_cancel_check >= 1.0:
+                        last_cancel_check = now
+                        if is_cancelled():
+                            handle.cancel()
+                            break
                     try:
                         line = line_queue.get(timeout=min(remaining, 1.0))
                     except queue.Empty:
@@ -391,6 +411,8 @@ class ClaudeCodeAdapter:
                             tool_calls.append(event)
                         if event.get("kind") == "final_text":
                             result_summary = event.get("text", result_summary)
+                        if event.get("kind") == "cost":
+                            cost_usd = event.get("cost_usd")
                         if on_event:
                             try:
                                 on_event(event)
@@ -469,6 +491,7 @@ class ClaudeCodeAdapter:
                 raw_stdout_lines=len(stdout_lines),
                 stderr_tail=stderr_output[-4000:],
                 tool_calls=tool_calls,
+                cost_usd=cost_usd,
             )
 
         return handle, _wait
@@ -540,7 +563,11 @@ def _parse_stream_line(line: str) -> list[dict]:
                 })
         return events
     if msg_type == "result":
-        return [{"kind": "final_text", "text": _scrub_secrets(obj.get("result", ""))}]
+        events = [{"kind": "final_text", "text": _scrub_secrets(obj.get("result", ""))}]
+        cost = obj.get("total_cost_usd")
+        if isinstance(cost, (int, float)):
+            events.append({"kind": "cost", "cost_usd": float(cost)})
+        return events
     if msg_type is None:
         return [{"kind": "other"}]
     return [{"kind": "other", "raw_type": msg_type}]

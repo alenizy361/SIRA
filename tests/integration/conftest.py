@@ -70,5 +70,8 @@ def org_id(db):
     db.execute(text("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE organization_id = :id)"), {"id": oid})
     db.execute(text("DELETE FROM plans WHERE organization_id = :id"), {"id": oid})
     db.execute(text("DELETE FROM goals WHERE organization_id = :id"), {"id": oid})
+    db.execute(text("DELETE FROM budget_transactions WHERE budget_id IN (SELECT id FROM budgets WHERE organization_id = :id)"), {"id": oid})
+    db.execute(text("DELETE FROM budgets WHERE organization_id = :id"), {"id": oid})
+    db.execute(text("DELETE FROM users WHERE organization_id = :id"), {"id": oid})
     db.execute(text("DELETE FROM organizations WHERE id = :id"), {"id": oid})
     db.commit()

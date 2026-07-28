@@ -267,6 +267,15 @@ export const plansApi = {
 
 export const tasksApi = {
   list: () => api.get<unknown[]>("/tasks"),
+  // Interrupts a specific in-flight task. If it's genuinely RUNNING, the
+  // worker's own poll of the resulting Cancellation row stops the subprocess
+  // and drives the task to CANCELLED itself; otherwise this cancels it
+  // immediately (state has not yet changed on return in the RUNNING case).
+  cancel: (id: string, reason?: string) =>
+    api.post<{ id: string; state: string; cancellation_requested: boolean }>(
+      `/tasks/${id}/cancel`,
+      { reason },
+    ),
 };
 
 export const runsApi = {

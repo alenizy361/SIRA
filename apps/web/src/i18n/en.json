@@ -125,7 +125,10 @@
     "resume_failed": "Could not resume",
     "goal_all_done": "Goal fully done — every task finished",
     "agent_result": "What the agent produced",
-    "work_log": "Work log (step by step)"
+    "work_log": "Work log (step by step)",
+    "cancel_task": "Stop",
+    "cancelling_task": "Stopping…",
+    "task_cancel_failed": "Could not stop this task"
   },
   "goals": {
     "title": "Goals",

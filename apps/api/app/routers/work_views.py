@@ -1,16 +1,33 @@
 """Read-only listing endpoints for plans/tasks - real queries against real
-tables, not mocks. Write paths (create/transition) for these will come with
-the full orchestrator wiring into the API in a later iteration - see
-docs/BUILD_STATUS.md."""
-from fastapi import APIRouter, Depends
+tables, not mocks, plus the one write path that exists so far: cancelling an
+in-flight task (constitution/Managed-Agents-parity: "interrupt a specific
+agent" - see cli_adapter.start_run's is_cancelled param and worker.py's
+_make_is_cancelled for the worker-side half of this). Further write paths
+(create/transition) will come with the full orchestrator wiring into the API
+in a later iteration - see docs/BUILD_STATUS.md."""
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.auth.dependencies import get_current_user
 from app.db import get_db
 from app.models.identity import User
-from app.models.work import Plan, Task
+from app.models.work import Cancellation, Plan, Run, Task
+from app.realtime.publisher import publish
+from contracts.events import EventType
+from orchestrator.state_machine import InvalidTransition, TaskState, transition_task
 
 router = APIRouter(tags=["work"])
+
+_TERMINAL_TASK_STATES = {
+    TaskState.COMPLETED.value,
+    TaskState.FAILED.value,
+    TaskState.CANCELLED.value,
+    TaskState.INCIDENT_OPENED.value,
+}
 
 
 @router.get("/plans")
@@ -44,3 +61,55 @@ def list_tasks(user: User = Depends(get_current_user), db: DbSession = Depends(g
         }
         for t in tasks
     ]
+
+
+class CancelTaskRequest(BaseModel):
+    reason: str | None = None
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_task(
+    task_id: uuid.UUID,
+    body: CancelTaskRequest = CancelTaskRequest(),
+    user: User = Depends(get_current_user),
+    db: DbSession = Depends(get_db),
+):
+    task = db.query(Task).filter(Task.id == task_id, Task.organization_id == user.organization_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.state in _TERMINAL_TASK_STATES:
+        raise HTTPException(status_code=409, detail=f"Task is already {task.state} - nothing to cancel")
+
+    latest_run = db.query(Run).filter(Run.task_id == task.id).order_by(Run.created_at.desc()).first()
+    db.add(Cancellation(
+        task_id=task.id,
+        run_id=latest_run.id if latest_run else None,
+        requested_by=user.id,
+        reason=body.reason,
+        created_at=datetime.now(timezone.utc),
+    ))
+
+    if task.state == TaskState.RUNNING.value:
+        # A subprocess is genuinely in flight. Don't flip task.state here -
+        # that would race the worker's own transition. The worker polls this
+        # Cancellation row (throttled to once/second, see
+        # claude_worker.worker._make_is_cancelled), stops the subprocess
+        # itself, and drives the task to CANCELLED once it actually exits.
+        db.commit()
+        return {"id": str(task.id), "state": task.state, "cancellation_requested": True}
+
+    # Nothing is running yet (READY/ASSIGNED/RETRY_WAIT/BLOCKED/
+    # HUMAN_INPUT_REQUIRED) - no worker loop is polling for this Cancellation
+    # row, so cancel immediately rather than leaving an idle task waiting on
+    # a signal nothing will ever check.
+    try:
+        task.state = transition_task(TaskState(task.state), TaskState.CANCELLED).value
+    except InvalidTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.add(task)
+    db.commit()
+    publish(
+        task.organization_id, EventType.TASK_CANCELLED, str(user.id), str(task.id),
+        payload={"title": task.title},
+    )
+    return {"id": str(task.id), "state": task.state, "cancellation_requested": True}

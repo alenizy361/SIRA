@@ -401,6 +401,88 @@ def _forward_worker_event(organization_id, task: Task, run, event: dict, tool_ca
     # kind == "other" carries no safe/useful content - not forwarded.
 
 
+def _make_is_cancelled(task_id: uuid.UUID, engine):
+    """Returns a closure polled by the adapter's run loop (throttled to
+    once/second there) to check whether an operator has requested this task's
+    in-flight run be stopped - the "interrupt a specific agent" primitive
+    Anthropic's Managed Agents API exposes as `user.interrupt`, which this
+    worker had no equivalent of until now (previously a started subprocess
+    ran to completion or its own timeout, full stop).
+
+    Opens its own short-lived session bound to the caller's engine (never a
+    freshly resolved get_sessionmaker() - see _forward_worker_event's
+    docstring for why that class of bug matters) since a Cancellation row is
+    written by the API process from an entirely separate request/session.
+    """
+
+    def _is_cancelled() -> bool:
+        from app.models.work import Cancellation
+
+        session = OrmSession(bind=engine)
+        try:
+            return (
+                session.query(Cancellation.id)
+                .filter(Cancellation.task_id == task_id)
+                .first()
+                is not None
+            )
+        finally:
+            session.close()
+
+    return _is_cancelled
+
+
+def _org_budget_exceeded(db, org_id) -> bool:
+    """True only when an operator has actually configured an org-level
+    monthly cap (Budget.scope == "org") AND spend + reserved has reached it.
+    No Budget row at all means unconfigured - never gates anything, so this
+    is opt-in enforcement, not a silent default limit. Real dollar spend
+    comes from the CLI's own reported total_cost_usd (see cli_adapter's
+    "cost" event and _commit_run_cost below) - not an estimate."""
+    from app.models.integrations import Budget
+
+    budget = (
+        db.query(Budget)
+        .filter(Budget.organization_id == org_id, Budget.scope == "org")
+        .first()
+    )
+    if budget is None or float(budget.monthly_max) <= 0:
+        return False
+    return float(budget.spent_amount) + float(budget.reserved_amount) >= float(budget.monthly_max)
+
+
+def _commit_run_cost(db, org_id, run_id: uuid.UUID, cost_usd) -> None:
+    """Records the CLI's real reported spend against the org's Budget row, if
+    one is configured. Idempotent per run (idempotency_key derived from
+    run_id) so re-processing the same run (e.g. after a crash mid-commit)
+    never double-counts its cost."""
+    if not cost_usd:
+        return
+    from app.models.integrations import Budget, BudgetTransaction
+
+    budget = (
+        db.query(Budget)
+        .filter(Budget.organization_id == org_id, Budget.scope == "org")
+        .first()
+    )
+    if budget is None:
+        return
+    idempotency_key = f"run-cost-{run_id}"
+    already_committed = (
+        db.query(BudgetTransaction.id)
+        .filter(BudgetTransaction.idempotency_key == idempotency_key)
+        .first()
+    )
+    if already_committed:
+        return
+    db.add(BudgetTransaction(
+        budget_id=budget.id, idempotency_key=idempotency_key, kind="commit",
+        amount=cost_usd, created_at=datetime.now(timezone.utc),
+    ))
+    budget.spent_amount = float(budget.spent_amount) + float(cost_usd)
+    db.add(budget)
+
+
 def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
     from app.models.work import Run
 
@@ -448,6 +530,26 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         core_state = CoreState.CODING if task.workspace_repo else CoreState.PLANNING
         publish_core_state(org_id, core_state, actor, str(task.id))
 
+        if _org_budget_exceeded(db, org_id):
+            # Refuse to spend a single further dollar once the org's monthly
+            # cap is hit - the CLI is never invoked. Reuses the same
+            # RUNNING->RETRY_WAIT path any other failure takes (auth blip,
+            # timeout, ...) rather than inventing a new FSM edge; the
+            # progression driver will keep retrying on its normal backoff,
+            # which naturally stops blocking once spend resets or the cap is
+            # raised. An org with no Budget row configured is never gated -
+            # this is opt-in enforcement, not a default limit nobody asked for.
+            logger.warning("Task %s blocked - organization %s is over its monthly budget", task.id, org_id)
+            run.state = "failed"
+            run.finished_at = datetime.now(timezone.utc)
+            db.add(run)
+            publish(org_id, EventType.TASK_BLOCKED, actor, str(task.id), payload={"reason": "budget_exceeded"}, entities=_task_entities(task, run))
+            task.state = transition_task(TaskState(task.state), TaskState.RETRY_WAIT).value
+            db.add(task)
+            db.commit()
+            publish_core_state(org_id, CoreState.IDLE, actor, str(task.id))
+            return 0
+
         contract = _task_to_contract(task)
         # Correlates a tool_call to its later tool_result so the persisted
         # ToolCall row gets updated in place rather than duplicated - local to
@@ -457,6 +559,7 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
             contract,
             run_id=str(run.id),
             on_event=lambda ev: _forward_worker_event(org_id, task, run, ev, tool_call_ids, db.get_bind()),
+            is_cancelled=_make_is_cancelled(task.id, db.get_bind()),
         )
         result = wait()
 
@@ -465,6 +568,26 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         run.branch_name = result.branch_name
         run.baseline_commit = result.baseline_commit
         run.result_summary = result.result_summary
+        run.cost_usd = result.cost_usd
+        # Spend is real the moment the CLI reports it - a cancelled, timed-out,
+        # or failed run can still have burned real tokens, so this is recorded
+        # unconditionally rather than only on the success path.
+        _commit_run_cost(db, org_id, run.id, result.cost_usd)
+
+        if result.cancelled and not result.timed_out:
+            # A genuine operator-requested cancel (as opposed to a timeout,
+            # which also calls handle.cancel() and sets .cancelled - the
+            # timed_out flag is what disambiguates the two).
+            run.state = "cancelled"
+            run.finished_at = datetime.now(timezone.utc)
+            db.add(run)
+            task.state = transition_task(TaskState(task.state), TaskState.CANCELLED).value
+            db.add(task)
+            db.commit()
+            publish(org_id, EventType.TASK_CANCELLED, actor, str(task.id), payload={"title": task.title}, entities=_task_entities(task, run))
+            publish_core_state(org_id, CoreState.IDLE, actor, str(task.id))
+            return 1
+
         run.state = "validating" if result.exit_code == 0 and not result.timed_out else "failed"
         db.add(run)
 

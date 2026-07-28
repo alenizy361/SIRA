@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session as DbSession
 
 from app.auth.dependencies import get_current_user
@@ -54,9 +55,53 @@ def list_budgets(user: User = Depends(get_current_user), db: DbSession = Depends
             "monthly_max": float(b.monthly_max),
             "reserved_amount": float(b.reserved_amount),
             "spent_amount": float(b.spent_amount),
+            "remaining": max(0.0, float(b.monthly_max) - float(b.spent_amount) - float(b.reserved_amount))
+            if float(b.monthly_max) > 0 else None,
         }
         for b in rows
     ]
+
+
+class SetOrgBudgetRequest(BaseModel):
+    monthly_max_usd: float
+    daily_max_usd: float = 0
+
+
+@router.post("/budgets/org-cap")
+def set_org_budget_cap(
+    body: SetOrgBudgetRequest,
+    user: User = Depends(get_current_user),
+    db: DbSession = Depends(get_db),
+):
+    """Upserts the org-wide monthly spend cap that claude_worker.worker's
+    _org_budget_exceeded enforces before every task run. Setting monthly_max_usd
+    to 0 turns enforcement back off (matches Budget's "no row / zero cap means
+    unconfigured" convention) rather than needing a separate delete path."""
+    if body.monthly_max_usd < 0 or body.daily_max_usd < 0:
+        raise HTTPException(status_code=422, detail="Budget caps cannot be negative")
+
+    budget = (
+        db.query(Budget)
+        .filter(Budget.organization_id == user.organization_id, Budget.scope == "org")
+        .first()
+    )
+    if budget is None:
+        budget = Budget(
+            organization_id=user.organization_id, scope="org", scope_ref=str(user.organization_id),
+            currency="USD",
+        )
+    budget.currency = "USD"
+    budget.monthly_max = body.monthly_max_usd
+    budget.daily_max = body.daily_max_usd
+    db.add(budget)
+    db.commit()
+    db.refresh(budget)
+    return {
+        "id": str(budget.id),
+        "monthly_max": float(budget.monthly_max),
+        "daily_max": float(budget.daily_max),
+        "spent_amount": float(budget.spent_amount),
+    }
 
 
 @router.get("/memory")
