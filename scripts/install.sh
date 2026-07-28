@@ -250,17 +250,41 @@ sync_repo_to_app_root() {
 setup_directory_structure() {
   log_step "Setting up directory structure under ${APP_ROOT}"
   mkdir -p "$APP_ROOT" "$BACKUP_ROOT" "$APP_ROOT/workspace"
-  # Root-owned: application code, compose files, infra config, .env.
-  chown -R root:root "$APP_ROOT"
-  chmod 750 "$APP_ROOT"
-  # aicompany-owned: its workspace (where the Claude CLI session state and
-  # working files for services/claude-worker live).
+
+  # Application code is owned by root but group-owned by aicompany with group
+  # read/traverse. This is the crucial bit: the claude-worker runs as the
+  # non-root aicompany user and must be able to cd into APP_ROOT, execute
+  # services/claude-worker/run.sh, and read the code + its .venv. With the
+  # previous root:root 0750 the worker (an "other" relative to root) could
+  # not even traverse APP_ROOT, so systemd failed every start with
+  # "CHDIR ... Permission denied" and crash-looped thousands of times.
+  # root keeps write; aicompany gets read+execute via the group; the world
+  # still gets nothing.
+  chown -R "root:${AICOMPANY_USER}" "$APP_ROOT"
+  chmod -R g+rX "$APP_ROOT"
+  chmod 2750 "$APP_ROOT"
+
+  # The workspace is aicompany's to write in (Claude CLI session state, task
+  # worktrees).
   chown -R "${AICOMPANY_USER}:${AICOMPANY_USER}" "$APP_ROOT/workspace"
-  chmod 750 "$APP_ROOT/workspace"
-  # Backups are root-owned (contain DB dumps and .env copies).
+  chmod 2770 "$APP_ROOT/workspace"
+
+  # run.sh must be executable by the group (aicompany).
+  chmod 0750 "$APP_ROOT/services/claude-worker/run.sh" 2>/dev/null || true
+
+  # .env holds secrets - root-only. The `chmod -R g+rX` above would have
+  # exposed it to the aicompany group, so lock it back down. The worker never
+  # needs to read it directly (systemd loads it via EnvironmentFile= and
+  # passes the values in as environment variables).
+  chown root:root "$APP_ROOT/.env" 2>/dev/null || true
+  chmod 0600 "$APP_ROOT/.env" 2>/dev/null || true
+
+  # Backups are root-only (DB dumps + .env copies) - the recursive g+rX above
+  # touched them too, so re-lock the whole subtree, not just its top dir.
   chown -R root:root "$BACKUP_ROOT"
+  chmod -R go-rwx "$BACKUP_ROOT"
   chmod 700 "$BACKUP_ROOT"
-  log_ok "Directory ownership set (root-owned app/config, ${AICOMPANY_USER}-owned workspace)"
+  log_ok "Directory ownership set (root-owned code, ${AICOMPANY_USER} group read/exec, ${AICOMPANY_USER}-owned workspace)"
 }
 
 # ---------------------------------------------------------------------------
