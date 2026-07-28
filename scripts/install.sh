@@ -442,8 +442,20 @@ install_systemd_units() {
     cp "$src" "/etc/systemd/system/${unit}"
   done
   systemctl daemon-reload
-  systemctl enable --now rabit-api.service rabit-web.service
-  if ! systemctl enable --now rabit-claude-worker.service; then
+  # `enable --now` STARTS a unit, but on a re-install the unit is already
+  # running the OLD container - and `enable --now` is a no-op for an
+  # already-active unit, so it would keep serving the stale image even
+  # though build_app_images just built a new one. `enable` (arm at boot)
+  # followed by `restart` (recreate the container from the freshly built
+  # image) is what actually makes a re-install take effect. This was a real
+  # bug: after a code update the dashboard kept showing the old build until
+  # the container was manually recreated.
+  systemctl enable rabit-api.service rabit-web.service >/dev/null 2>&1 || true
+  log_step "Restarting app services to pick up the freshly built images"
+  systemctl restart rabit-api.service
+  systemctl restart rabit-web.service
+  systemctl enable rabit-claude-worker.service >/dev/null 2>&1 || true
+  if ! systemctl restart rabit-claude-worker.service; then
     log_warn "rabit-claude-worker.service did not start cleanly. This is expected if 'claude auth login' has not been run yet as ${AICOMPANY_USER} — see the manual step printed at the end of this script."
   fi
 }
