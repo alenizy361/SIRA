@@ -40,9 +40,33 @@ if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
 else
   bad "$UNIT is NOT running"
   PROBLEMS=$((PROBLEMS+1))
-  echo "---- last 20 log lines ----"
-  journalctl -u "$UNIT" -n 20 --no-pager 2>/dev/null | tail -20
+  # The FIRST exception is what matters; the tail is usually just systemd's
+  # restart chatter. Surface the actual Python error line explicitly so the
+  # cause is obvious without reading a wall of traceback.
+  echo "---- the actual error (most recent) ----"
+  journalctl -u "$UNIT" -n 400 --no-pager 2>/dev/null \
+    | grep -aiE "error|exception|traceback|refused|denied|no such|not found|could not|failed to" \
+    | tail -8
+  echo "---- last 25 log lines ----"
+  journalctl -u "$UNIT" -n 25 --no-pager 2>/dev/null | tail -25
   echo "---------------------------"
+  # A latched start-rate limit makes every later restart a silent no-op.
+  if systemctl show "$UNIT" -p ExecMainStatus,NRestarts,Result 2>/dev/null | grep -q "Result=start-limit-hit"; then
+    warn "systemd has LATCHED this unit off (start-limit-hit) - clearing it now."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Datastore reachability FROM THE HOST is the worker's most common hard
+# dependency failure: the API can be perfectly healthy (it talks to Postgres
+# over the compose network as 'postgres') while the host worker, which must
+# reach 127.0.0.1:5432, cannot connect at all because the container is not
+# publishing that port. Show the published ports so the difference is visible.
+# ---------------------------------------------------------------------------
+if command -v docker >/dev/null 2>&1; then
+  say "1b/5 datastore ports published to the host"
+  docker ps --format '  {{.Names}}  {{.Ports}}' 2>/dev/null | grep -Ei 'postgres|redis' || \
+    warn "No postgres/redis containers are running - start them: docker compose -f ${APP_ROOT}/docker-compose.yml up -d"
 fi
 
 # ---------------------------------------------------------------------------

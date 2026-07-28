@@ -40,10 +40,19 @@ Environment=RABIT_API_URL=http://127.0.0.1:8000
 EnvironmentFile=-/opt/rabit-ai-company-os/.env
 
 ExecStart=/opt/rabit-ai-company-os/services/claude-worker/run.sh
-Restart=on-failure
+# Restart ALWAYS, and never let systemd latch the unit off. This is a poll
+# loop whose dependencies (Postgres, Redis, the Claude session) can be briefly
+# unavailable - during a redeploy, a container recreate, a reboot. With a start
+# rate limit, a handful of such failures put the unit in a permanently failed
+# state that refuses every later start ("start request repeated too quickly"),
+# so the company stayed dead long after the underlying cause was fixed and a
+# plain `systemctl restart` silently did nothing. StartLimitIntervalSec=0
+# disables that latch: the worker keeps retrying every RestartSec until its
+# dependencies come back, which is the correct behavior for a self-healing
+# background worker.
+Restart=always
 RestartSec=10
-StartLimitIntervalSec=600
-StartLimitBurst=10
+StartLimitIntervalSec=0
 
 # Hardening: this process only needs its own workspace, the aicompany home
 # (for the claude CLI's auth/session state), and outbound + localhost
