@@ -44,8 +44,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Host-side ports are deliberately NOT the conventional 8000/3000:
+    # Nginx is the only thing on this host that ever talks to these directly
+    # (the browser calls same-origin "/api" + "/ws", proxied by Nginx - see
+    # apps/web/src/lib/api.ts and infra/nginx/rabit-os.conf.template), so
+    # there is no reason to occupy the common 3000/8000 ports that a VPS
+    # already running other Node/Python apps is very likely using. Override
+    # via .env if 18080/18081 also happen to collide with something.
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_PORT:-18081}:8000"
     volumes:
       - ./packages/agent-specs:/app/packages/agent-specs:ro
 
@@ -54,12 +61,10 @@ services:
       context: .
       dockerfile: infra/docker/web.Dockerfile
     restart: unless-stopped
-    environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     depends_on:
       - api
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${WEB_PORT:-18080}:3000"
 
 volumes:
   postgres_data:

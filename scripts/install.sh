@@ -13,7 +13,12 @@
 #   - Alembic migrations live under apps/api/alembic and are runnable as
 #     `alembic upgrade head` from inside the `api` container's working dir.
 #   - The API serves health endpoints at /health/live, /health/ready,
-#     /health/dependencies on port 8000; the web app serves on port 3000.
+#     /health/dependencies, host-published at 127.0.0.1:${API_PORT:-18081};
+#     the web app is host-published at 127.0.0.1:${WEB_PORT:-18080}. Neither
+#     port is meant to be reached directly by a browser - only Nginx and
+#     local health checks use them (see docker-compose.yml and
+#     infra/nginx/rabit-os.conf.template for why 8000/3000 were dropped:
+#     a VPS already running other apps is very likely already using those).
 #
 # Safe to re-run: every step below checks current state before acting.
 #
@@ -393,12 +398,15 @@ configure_nginx() {
     return
   fi
   local domain="${DOMAIN:-_}"
+  local web_port="${WEB_PORT:-18080}"
+  local api_port="${API_PORT:-18081}"
   local template="$APP_ROOT/infra/nginx/rabit-os.conf.template"
   [[ -f "$template" ]] || { log_warn "Template ${template} not found — skipping nginx configuration."; return; }
 
-  log_step "Configuring Nginx (DOMAIN=${domain})"
+  log_step "Configuring Nginx (DOMAIN=${domain}, WEB_PORT=${web_port}, API_PORT=${api_port})"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-  DOMAIN="$domain" envsubst '${DOMAIN}' < "$template" > /etc/nginx/sites-available/rabit-os.conf
+  DOMAIN="$domain" WEB_PORT="$web_port" API_PORT="$api_port" \
+    envsubst '${DOMAIN} ${WEB_PORT} ${API_PORT}' < "$template" > /etc/nginx/sites-available/rabit-os.conf
 
   if [[ "$domain" == "_" ]]; then
     # No real domain configured: this server block is meant to catch bare-IP
@@ -480,8 +488,10 @@ main() {
     log_error "Smoke tests failed — the stack is installed but not fully healthy yet. Run 'scripts/doctor.sh' for a diagnosis."
   fi
 
-  local dashboard_url="http://${DOMAIN:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
-  [[ -z "${DOMAIN:-}" ]] && dashboard_url="http://localhost:3000 (or http://<server-ip>:3000 if accessed remotely without a domain/Nginx)"
+  # Always port 80 via Nginx (default_server when DOMAIN is unset - see
+  # configure_nginx) - never a container port directly; the browser is
+  # never meant to reach 18080/18081 itself.
+  local dashboard_url="http://${DOMAIN:-$(hostname -I 2>/dev/null | awk '{print $1}')}/"
 
   log_step "Install finished"
   echo ""

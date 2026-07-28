@@ -28,8 +28,14 @@ __RABIT_COMMON_SH_LOADED=1
 : "${BACKUP_ROOT:=${APP_ROOT}/backups}"
 : "${AICOMPANY_USER:=aicompany}"
 : "${DB_NAME:=rabit_os}"
-: "${API_URL:=http://localhost:8000}"
-: "${WEB_URL:=http://localhost:3000}"
+# Host-published container ports - deliberately not 8000/3000 (see
+# docker-compose.yml and infra/nginx/rabit-os.conf.template): the browser
+# never talks to these directly, only Nginx and these local health checks
+# do, so they're free to avoid whatever a VPS's other apps already use.
+: "${API_PORT:=18081}"
+: "${WEB_PORT:=18080}"
+: "${API_URL:=http://localhost:${API_PORT}}"
+: "${WEB_URL:=http://localhost:${WEB_PORT}}"
 : "${COMPOSE_FILE:=${APP_ROOT}/docker-compose.yml}"
 
 # --- Logging -------------------------------------------------------------
@@ -140,6 +146,13 @@ load_env_file() {
 # near the top, before relying on DB_NAME/POSTGRES_*/REDIS_* values.
 sync_env_defaults() {
   DB_NAME="${POSTGRES_DB:-$DB_NAME}"
+  # API_URL/WEB_URL were defaulted from API_PORT/WEB_PORT at the top of this
+  # file, before load_env_file (called after this point in every script) had
+  # a chance to apply a customized port from .env - recompute them now so a
+  # customized API_PORT/WEB_PORT in .env is actually honored, not silently
+  # ignored in favor of the pre-.env default port.
+  API_URL="http://localhost:${API_PORT}"
+  WEB_URL="http://localhost:${WEB_PORT}"
 }
 
 # --- confirmation prompt ---------------------------------------------------

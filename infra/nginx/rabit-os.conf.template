@@ -3,11 +3,13 @@
 # Rabit AI Company OS — Nginx reverse proxy template.
 #
 # Rendered by scripts/install.sh via:
-#   DOMAIN=your.domain envsubst '${DOMAIN}' < rabit-os.conf.template > /etc/nginx/sites-available/rabit-os.conf
+#   DOMAIN=your.domain WEB_PORT=18080 API_PORT=18081 \
+#     envsubst '${DOMAIN} ${WEB_PORT} ${API_PORT}' < rabit-os.conf.template \
+#     > /etc/nginx/sites-available/rabit-os.conf
 #
-# ONLY the ${DOMAIN} placeholder is substituted — every other nginx `$variable`
-# below (e.g. $host, $remote_addr, $http_upgrade) is left alone on purpose and
-# must remain literal in the rendered file.
+# ONLY ${DOMAIN}/${WEB_PORT}/${API_PORT} are substituted — every other nginx
+# `$variable` below (e.g. $host, $remote_addr, $http_upgrade) is left alone
+# on purpose and must remain literal in the rendered file.
 #
 # SECURITY NOTE — READ BEFORE CHANGING:
 #   Postgres (5432) and Redis (6379) must NEVER be added to this file, never
@@ -19,13 +21,17 @@
 #   what's required").
 #
 # ASSUMPTIONS (verify against the real apps/api and apps/web once built):
-#   - Next.js (apps/web) listens on 127.0.0.1:3000
-#   - FastAPI (apps/api) listens on 127.0.0.1:8000 and serves its own routes
-#     at root (i.e. Nginx strips the /api/ prefix via the trailing slash on
-#     proxy_pass below — apps/api should NOT also expect a /api prefix
-#     internally)
+#   - Next.js (apps/web) is published on the host at 127.0.0.1:${WEB_PORT}
+#     (default 18080 - deliberately not 3000, since a VPS already running
+#     other Node apps very likely has that taken) and FastAPI at
+#     127.0.0.1:${API_PORT} (default 18081, not 8000, same reasoning).
+#   - The browser NEVER talks to those ports directly - it calls same-origin
+#     "/api/*" (apps/web/src/lib/api.ts) and "/ws" (apps/web/src/lib/ws.ts),
+#     which is what this file proxies. Nginx strips the /api/ prefix via the
+#     trailing slash on proxy_pass below, so apps/api itself has no /api
+#     prefix on any route.
 #   - The realtime dashboard WebSocket (packages/contracts/events.py) is
-#     served by the API process at /ws
+#     served by the API process at /ws (not /api/ws).
 
 # --- gzip -------------------------------------------------------------
 gzip on;
@@ -47,12 +53,12 @@ gzip_types
 
 # --- upstream definitions ----------------------------------------------
 upstream rabit_web_upstream {
-    server 127.0.0.1:3000;
+    server 127.0.0.1:${WEB_PORT};
     keepalive 16;
 }
 
 upstream rabit_api_upstream {
-    server 127.0.0.1:8000;
+    server 127.0.0.1:${API_PORT};
     keepalive 16;
 }
 

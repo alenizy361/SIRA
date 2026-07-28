@@ -1,8 +1,15 @@
 // Small typed fetch wrapper around the real Rabit AI Company OS FastAPI backend.
 // Always sends credentials so the httpOnly `rabit_session` cookie flows.
 
-export const API_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "http://localhost:8000";
+// Relative by default: nginx (infra/nginx/rabit-os.conf.template) proxies
+// same-origin "/api/*" to the FastAPI container and "/ws" to its WebSocket
+// route, which is what every real deployment (a VPS behind Nginx, reached
+// from an external browser) actually needs - "http://localhost:8000" only
+// ever works when the browser and the server are the same machine, which
+// is true in local sandbox testing but never true for a real user. Local
+// dev without Nginx in front (`npm run dev` hitting the API directly) can
+// still override this with NEXT_PUBLIC_API_URL=http://localhost:8000.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "/api";
 
 export class ApiError extends Error {
   status: number;

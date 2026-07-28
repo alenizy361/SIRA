@@ -5,6 +5,26 @@ const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
 
 /**
+ * The WebSocket constructor requires an absolute ws(s):// URL - it cannot
+ * take a relative path the way fetch() can. API_URL defaults to the
+ * relative "/api" (see api.ts), so the common case here builds an absolute
+ * URL from the current page's own origin, hitting Nginx's plain "/ws"
+ * location (infra/nginx/rabit-os.conf.template) - deliberately NOT under
+ * "/api", since that's where the FastAPI container's own unprefixed /ws
+ * route actually lives. When API_URL is an explicit absolute override
+ * (local dev without Nginx, e.g. http://localhost:8000), fall back to the
+ * old same-origin-as-API-host behavior instead.
+ */
+function wsUrl(): string {
+  if (/^https?:\/\//.test(API_URL)) {
+    return `${API_URL.replace(/^http/, "ws")}/ws`;
+  }
+  if (typeof window === "undefined") return "";
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/ws`;
+}
+
+/**
  * Manages a single reconnecting WebSocket connection to the /ws realtime
  * feed. Reconnects with exponential backoff and always reconnects with
  * ?since_seq=<lastSeq> so the server replays anything missed.
@@ -29,13 +49,12 @@ export class RealtimeClient {
 
   private connect() {
     if (this.closedByUser) return;
-    const wsBase = API_URL.replace(/^http/, "ws");
     const sinceSeq = useEventStore.getState().lastSeq;
     useEventStore.getState().setWsStatus(this.attempt === 0 ? "connecting" : "reconnecting");
 
     let socket: WebSocket;
     try {
-      socket = new WebSocket(`${wsBase}/ws?since_seq=${sinceSeq}`);
+      socket = new WebSocket(`${wsUrl()}?since_seq=${sinceSeq}`);
     } catch {
       this.scheduleReconnect();
       return;

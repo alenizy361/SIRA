@@ -12,11 +12,14 @@
 #
 # ASSUMPTION: health endpoints are served at API root (not under /api/) even
 # though Nginx exposes the API under /api/ publicly — this script talks to
-# the API directly on API_URL (default http://localhost:8000), bypassing
-# Nginx, which is the normal pattern for local health checks.
+# the API directly on its host-published container port, bypassing Nginx,
+# which is the normal pattern for local health checks.
 #
-# Env overrides: API_URL (default http://localhost:8000)
-#                WEB_URL (default http://localhost:3000)
+# Env overrides: API_PORT / WEB_PORT (read from .env, default 18081/18080 -
+# see docker-compose.yml and infra/nginx/rabit-os.conf.template for why
+# these aren't 8000/3000). API_URL/WEB_URL are always derived from these by
+# common.sh's sync_env_defaults - set API_PORT/WEB_PORT, not API_URL/WEB_URL
+# directly, or your override will be silently recomputed away.
 #
 # Usage: scripts/smoke-test.sh
 set -euo pipefail
