@@ -128,7 +128,14 @@
     "work_log": "سجل العمل (خطوة بخطوة)",
     "cancel_task": "إيقاف",
     "cancelling_task": "جارٍ الإيقاف…",
-    "task_cancel_failed": "تعذّر إيقاف هذه المهمة"
+    "task_cancel_failed": "تعذّر إيقاف هذه المهمة",
+    "reply_toggle": "رد",
+    "reply_placeholder": "اكتب ردًا لهذا الوكيل…",
+    "reply_send": "إرسال",
+    "reply_sending": "جارٍ الإرسال…",
+    "reply_no_session_yet": "لم تُنهِ هذه المهمة أي تشغيل بعد، فلا توجد محادثة للرد عليها.",
+    "reply_failed": "تعذّر إرسال هذه الرسالة",
+    "reply_waiting": "بانتظار الرد…"
   },
   "goals": {
     "title": "الأهداف",

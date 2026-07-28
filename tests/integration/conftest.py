@@ -62,6 +62,7 @@ def org_id(db):
     # Rows that reference runs (must go before runs are deleted).
     for tbl in ("tool_calls", "run_events", "validations"):
         db.execute(text(f"DELETE FROM {tbl} WHERE run_id IN (" + run_subq + ")"), {"id": oid})
+    db.execute(text("DELETE FROM task_messages WHERE task_id IN (" + task_subq + ")"), {"id": oid})
     db.execute(text("DELETE FROM runs WHERE organization_id = :id"), {"id": oid})
     # Rows that reference tasks (must go before tasks are deleted).
     for tbl in ("task_dependencies", "retry_records", "task_attempts", "cancellations", "reviews"):

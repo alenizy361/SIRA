@@ -128,7 +128,14 @@
     "work_log": "Work log (step by step)",
     "cancel_task": "Stop",
     "cancelling_task": "Stopping…",
-    "task_cancel_failed": "Could not stop this task"
+    "task_cancel_failed": "Could not stop this task",
+    "reply_toggle": "Reply",
+    "reply_placeholder": "Reply to this agent…",
+    "reply_send": "Send",
+    "reply_sending": "Sending…",
+    "reply_no_session_yet": "This task hasn't finished a run yet, so there's nothing to reply into.",
+    "reply_failed": "Could not send that message",
+    "reply_waiting": "Waiting for a reply…"
   },
   "goals": {
     "title": "Goals",

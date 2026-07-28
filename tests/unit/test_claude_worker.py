@@ -262,3 +262,36 @@ def test_allowed_tools_flag_is_never_omitted():
     # that must go through the approvals flow, not a default.
     for risk in ("R0", "R1", "R2", "R3"):
         assert "Bash" not in ClaudeCodeAdapter._effective_allowed_tools(contract(risk, []))
+
+
+def test_parse_stream_line_captures_session_id_from_init_message():
+    """A later human reply resumes this exact session (start_run's
+    resume_session_id) - this is the only place that id is ever observed."""
+    import json
+
+    line = json.dumps({"type": "system", "subtype": "init", "session_id": "abc-123-session"})
+    events = _parse_stream_line(line)
+    assert events == [{"kind": "session_id", "session_id": "abc-123-session"}]
+
+
+def test_parse_stream_line_ignores_non_init_system_messages():
+    import json
+
+    line = json.dumps({"type": "system", "subtype": "post_turn_summary"})
+    events = _parse_stream_line(line)
+    assert events == [{"kind": "other", "raw_type": "system"}]
+
+
+def test_parse_stream_line_stream_events_are_not_forwarded_yet():
+    """--include-partial-messages makes the CLI emit token-level
+    content_block_delta lines, but nothing downstream consumes them yet -
+    they must fall into the harmless "other" bucket, not crash or leak
+    partial (unscrubbed) text."""
+    import json
+
+    line = json.dumps({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+    })
+    events = _parse_stream_line(line)
+    assert events == [{"kind": "other", "raw_type": "stream_event"}]

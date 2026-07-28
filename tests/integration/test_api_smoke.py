@@ -497,3 +497,66 @@ def test_cancel_endpoint_rejects_an_already_terminal_task(client):
 
     resp = client.post(f"/tasks/{task_id}/cancel", json={})
     assert resp.status_code == 409, resp.text
+
+
+def test_message_endpoint_rejects_a_task_with_no_completed_run_yet(client):
+    """There is nothing to --resume until a real CLI session has run at
+    least once - posting a message to a task that hasn't must be rejected,
+    not silently queued forever."""
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    task = _make_task_for_cancel(db, org_id, state="ready")
+    task_id = str(task.id)
+    db.close()
+
+    resp = client.post(f"/tasks/{task_id}/messages", json={"content": "hey, any update?"})
+    assert resp.status_code == 409, resp.text
+
+
+def test_message_endpoint_accepts_and_lists_a_real_conversation_thread(client):
+    """POST records the human turn and GET returns the full thread in
+    order - the two halves of the real chat feature (the worker's
+    claude_worker.worker._execute_reply produces the agent's half once it
+    resumes the session, tested separately in test_worker_poll.py)."""
+    from app.db import get_sessionmaker
+    from app.models.identity import Organization
+    from app.models.work import Run
+
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    task = _make_task_for_cancel(db, org_id, state="completed")
+    run = Run(
+        organization_id=org_id, task_id=task.id, agent_key="backend_engineer",
+        state="completed", cli_session_id="sess-api-test-123",
+    )
+    db.add(run)
+    db.commit()
+    task_id = str(task.id)
+    db.close()
+
+    resp = client.post(f"/tasks/{task_id}/messages", json={"content": "Can you shorten the summary?"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["role"] == "human"
+    assert body["body"] == "Can you shorten the summary?"
+    assert body["task_id"] == task_id
+
+    resp = client.get(f"/tasks/{task_id}/messages")
+    assert resp.status_code == 200, resp.text
+    messages = resp.json()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "human"
+
+    resp = client.post(f"/tasks/{task_id}/messages", json={"content": ""})
+    assert resp.status_code == 422, "an empty message body must be rejected"

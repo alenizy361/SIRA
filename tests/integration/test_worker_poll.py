@@ -4,6 +4,7 @@ here (ClaudeCodeAdapter.start_run) so these tests are free/fast and exercise
 only the worker's own DB/state-machine/leasing wiring - the real CLI
 invocation is separately proven in test_claude_worker_e2e.py."""
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from claude_worker.worker import run_once
@@ -13,7 +14,7 @@ class _FakeRunResult(SimpleNamespace):
     pass
 
 
-def _fake_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None):
+def _fake_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
     class _Handle:
         cancelled = False
 
@@ -28,6 +29,7 @@ def _fake_start_run(self, contract, run_id=None, on_event=None, is_cancelled=Non
             timed_out=False,
             cancelled=False,
             cost_usd=None,
+            cli_session_id=None,
             workspace_path="/tmp/fake",
             branch_name="agent/fake",
             baseline_commit="abc123",
@@ -94,7 +96,7 @@ def test_unexpected_run_error_lands_task_in_retry_wait_not_stuck_running(db, org
     from app.models.work import RunLease
     from claude_worker.cli_adapter import ClaudeCodeAdapter
 
-    def _boom_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None):
+    def _boom_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
         raise FileNotFoundError("claude CLI not found on host")
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _boom_start_run)
@@ -342,7 +344,7 @@ def test_worker_stops_a_running_task_and_marks_it_cancelled_when_an_operator_req
     db.commit()
     db.refresh(user)
 
-    def _fake_start_run_honoring_cancel(self, contract, run_id=None, on_event=None, is_cancelled=None):
+    def _fake_start_run_honoring_cancel(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
         class _Handle:
             cancelled = False
 
@@ -364,7 +366,7 @@ def test_worker_stops_a_running_task_and_marks_it_cancelled_when_an_operator_req
 
             return _FakeRunResult(
                 task_id=contract.task_id, run_id=run_id, exit_code=None, timed_out=False,
-                cancelled=True, cost_usd=None, workspace_path="/tmp/fake",
+                cancelled=True, cost_usd=None, cli_session_id=None, workspace_path="/tmp/fake",
                 branch_name="agent/fake", baseline_commit="abc123", final_commit=None,
                 result_summary="", changed_files=[],
             )
@@ -400,7 +402,7 @@ def test_task_is_blocked_when_the_assigned_agents_own_budget_is_exceeded(db, org
     ))
     db.commit()
 
-    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None):
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
         raise AssertionError("the CLI must not be invoked once this agent is over its own budget")
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
@@ -486,7 +488,7 @@ def test_task_is_blocked_without_invoking_the_cli_once_org_budget_is_exceeded(db
     ))
     db.commit()
 
-    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None):
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
         raise AssertionError("the CLI must not be invoked once the org is over budget")
 
     monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
@@ -516,7 +518,7 @@ def test_real_run_cost_is_committed_against_the_configured_budget(db, org_id, mo
     db.commit()
     db.refresh(budget)
 
-    def _fake_start_run_with_cost(self, contract, run_id=None, on_event=None, is_cancelled=None):
+    def _fake_start_run_with_cost(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
         class _Handle:
             cancelled = False
 
@@ -526,7 +528,7 @@ def test_real_run_cost_is_committed_against_the_configured_budget(db, org_id, mo
         def _wait():
             return _FakeRunResult(
                 task_id=contract.task_id, run_id=run_id, exit_code=0, timed_out=False,
-                cancelled=False, cost_usd=2.5, workspace_path="/tmp/fake",
+                cancelled=False, cost_usd=2.5, cli_session_id="sess-cost-test", workspace_path="/tmp/fake",
                 branch_name="agent/fake", baseline_commit="abc123", final_commit="def456",
                 result_summary="Done.", changed_files=[],
             )
@@ -550,3 +552,155 @@ def test_real_run_cost_is_committed_against_the_configured_budget(db, org_id, mo
     assert float(budget.spent_amount) == 2.5
     txn = db.query(BudgetTransaction).filter(BudgetTransaction.idempotency_key == f"run-cost-{run.id}-{budget.id}").one()
     assert float(txn.amount) == 2.5
+
+
+def _make_task_with_completed_run(db, org_id, cli_session_id="sess-original-abc"):
+    """A task that already finished once and has a real prior CLI session -
+    the precondition for a reply to have anything to resume."""
+    from app.models.work import Run, Task
+
+    task = Task(
+        organization_id=org_id, title="Explain the pricing page copy", description="d",
+        assigned_agent_key="frontend_engineer", state="completed",
+        idempotency_key=f"task-{uuid.uuid4()}", acceptance_criteria={},
+    )
+    db.add(task)
+    db.flush()
+    run = Run(
+        organization_id=org_id, task_id=task.id, agent_key="frontend_engineer",
+        state="completed", cli_session_id=cli_session_id,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def test_reply_resumes_the_tasks_prior_cli_session_and_records_the_agents_answer(db, org_id, monkeypatch):
+    """The point of the whole feature: a human's follow-up message must
+    resume the EXACT prior CLI session (not start a fresh, context-less
+    run), and the agent's answer must land as its own TaskMessage row -
+    task.state must stay untouched, since a reply is a conversation turn,
+    not an FSM transition."""
+    from app.models.work import Run, TaskMessage
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    task = _make_task_with_completed_run(db, org_id, cli_session_id="sess-original-abc")
+    db.add(TaskMessage(
+        organization_id=org_id, task_id=task.id, role="human",
+        body="Actually, can you make the headline shorter?",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    captured = {}
+
+    def _fake_resume_start_run(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
+        captured["resume_session_id"] = resume_session_id
+        captured["mission"] = contract.mission
+
+        class _Handle:
+            cancelled = False
+
+            def cancel(self):
+                pass
+
+        def _wait():
+            return _FakeRunResult(
+                task_id=contract.task_id, run_id=run_id, exit_code=0, timed_out=False,
+                cancelled=False, cost_usd=None, cli_session_id="sess-original-abc", workspace_path="/tmp/fake",
+                branch_name="agent/fake", baseline_commit="abc123", final_commit=None,
+                result_summary="Sure - shortened to 'Grow faster.'", changed_files=[],
+            )
+
+        return _Handle(), _wait
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _fake_resume_start_run)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 1
+
+    assert captured["resume_session_id"] == "sess-original-abc"
+    assert captured["mission"] == "Actually, can you make the headline shorter?"
+
+    db.refresh(task)
+    assert task.state == "completed"  # untouched - a reply is not an FSM step
+
+    messages = db.query(TaskMessage).filter(TaskMessage.task_id == task.id).order_by(TaskMessage.created_at).all()
+    assert [m.role for m in messages] == ["human", "agent"]
+    assert "Grow faster" in messages[1].body
+
+    reply_run = db.query(Run).filter(Run.task_id == task.id).order_by(Run.created_at.desc()).first()
+    assert messages[1].run_id == reply_run.id
+    assert reply_run.cli_session_id == "sess-original-abc"
+
+
+def test_reply_is_skipped_while_a_lease_is_already_held_for_that_task(db, org_id, monkeypatch):
+    """Prevents two poll ticks (or a still-running original task) from
+    processing the same conversation concurrently."""
+    from datetime import timedelta
+
+    from app.models.work import Run, RunLease, TaskMessage
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    task = _make_task_with_completed_run(db, org_id)
+    db.add(TaskMessage(
+        organization_id=org_id, task_id=task.id, role="human", body="hello?",
+        created_at=datetime.now(timezone.utc),
+    ))
+    in_flight_run = Run(organization_id=org_id, task_id=task.id, agent_key="frontend_engineer", state="running")
+    db.add(in_flight_run)
+    db.flush()
+    now = datetime.now(timezone.utc)
+    db.add(RunLease(
+        task_id=task.id, run_id=in_flight_run.id, worker_id="some-other-worker",
+        acquired_at=now, expires_at=now + timedelta(minutes=5),
+    ))
+    db.commit()
+
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
+        raise AssertionError("must not process a reply while its task's lease is already held")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 0
+
+    remaining = db.query(TaskMessage).filter(TaskMessage.task_id == task.id).all()
+    assert len(remaining) == 1  # still just the human message - no reply attempted
+
+
+def test_task_with_no_prior_session_is_skipped_for_reply(db, org_id, monkeypatch):
+    """A task somehow has a pending human message but no Run ever captured a
+    cli_session_id (e.g. it predates this feature) - there is nothing safe
+    to resume, so the poll tick must skip it rather than crash or start a
+    context-less fresh run under the guise of a reply."""
+    from app.models.work import Task, TaskMessage
+    from claude_worker.cli_adapter import ClaudeCodeAdapter
+
+    task = Task(
+        organization_id=org_id, title="Old task, no session on record", description="d",
+        assigned_agent_key="frontend_engineer", state="completed",
+        idempotency_key=f"task-{uuid.uuid4()}", acceptance_criteria={},
+    )
+    db.add(task)
+    db.commit()
+    db.add(TaskMessage(
+        organization_id=org_id, task_id=task.id, role="human", body="hello?",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    def _start_run_must_not_be_called(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
+        raise AssertionError("must not attempt to resume a session that never existed")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "start_run", _start_run_must_not_be_called)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", lambda self: {"loggedIn": True})
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root="/tmp/fake-workspace")
+
+    executed = run_once(db, adapter, agent_concurrency_limits={"frontend_engineer": 5})
+    assert executed == 0

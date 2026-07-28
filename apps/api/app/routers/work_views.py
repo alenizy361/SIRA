@@ -9,13 +9,13 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session as DbSession
 
 from app.auth.dependencies import get_current_user
 from app.db import get_db
 from app.models.identity import User
-from app.models.work import Cancellation, Plan, Run, Task
+from app.models.work import Cancellation, Plan, Run, Task, TaskMessage
 from app.realtime.publisher import publish
 from contracts.events import EventType
 from orchestrator.state_machine import InvalidTransition, TaskState, transition_task
@@ -113,3 +113,74 @@ def cancel_task(
         payload={"title": task.title},
     )
     return {"id": str(task.id), "state": task.state, "cancellation_requested": True}
+
+
+def _serialize_message(m: TaskMessage) -> dict:
+    return {
+        "id": str(m.id),
+        "task_id": str(m.task_id),
+        "role": m.role,
+        "body": m.body,
+        "run_id": str(m.run_id) if m.run_id else None,
+        "created_at": m.created_at.isoformat(),
+    }
+
+
+@router.get("/tasks/{task_id}/messages")
+def list_task_messages(task_id: uuid.UUID, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id, Task.organization_id == user.organization_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows = (
+        db.query(TaskMessage)
+        .filter(TaskMessage.task_id == task_id, TaskMessage.organization_id == user.organization_id)
+        .order_by(TaskMessage.created_at.asc())
+        .all()
+    )
+    return [_serialize_message(m) for m in rows]
+
+
+class SendTaskMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+
+
+@router.post("/tasks/{task_id}/messages")
+def send_task_message(
+    task_id: uuid.UUID,
+    body: SendTaskMessageRequest,
+    user: User = Depends(get_current_user),
+    db: DbSession = Depends(get_db),
+):
+    """Posts the human side of a real, continued conversation with this
+    task's agent. claude_worker.worker's poll loop (_pending_reply_requests/
+    _execute_reply) picks this up and resumes the task's actual CLI session
+    (Run.cli_session_id) for the reply - not a summary, the same session
+    with full context of everything it already did."""
+    task = db.query(Task).filter(Task.id == task_id, Task.organization_id == user.organization_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    has_session = (
+        db.query(Run.id)
+        .filter(Run.task_id == task_id, Run.cli_session_id.isnot(None))
+        .first()
+    )
+    if has_session is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This task has no completed run yet - there is no session to reply into.",
+        )
+
+    message = TaskMessage(
+        organization_id=user.organization_id, task_id=task_id, role="human",
+        body=body.content, created_at=datetime.now(timezone.utc),
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+
+    publish(
+        user.organization_id, EventType.TASK_MESSAGE, str(user.id), str(task_id),
+        payload={"role": "human", "body": body.content},
+    )
+    return _serialize_message(message)

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useI18n } from "@/i18n/I18nProvider";
 import { goalsApi, tasksApi } from "@/lib/api";
 import { agentMeta } from "@/lib/agentMeta";
+import { TaskConversation } from "./TaskConversation";
 
 const RISK_COLOR: Record<string, string> = {
   R0: "#34d399",
@@ -197,6 +198,7 @@ export function GoalPlanPanel({
                     </div>
                   </details>
                 ) : null}
+                {task.result ? <TaskConversation taskId={task.id} /> : null}
                 <div className="mt-2 flex items-center gap-2">
                   <span
                     className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"

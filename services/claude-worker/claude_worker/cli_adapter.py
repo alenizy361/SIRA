@@ -67,6 +67,7 @@ class CliCapabilities:
     supports_json_schema: bool
     supports_max_budget_usd: bool
     supports_effort: bool
+    supports_resume: bool
 
 
 @dataclass
@@ -89,6 +90,10 @@ class RunResult:
     stderr_tail: str = ""
     tool_calls: list[dict] = field(default_factory=list)
     cost_usd: Optional[float] = None
+    # The CLI's own session id for this run (captured from stream-json's
+    # system/init message) - a later reply resumes this exact session
+    # (start_run's resume_session_id) instead of starting a fresh one.
+    cli_session_id: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -142,6 +147,7 @@ class ClaudeCodeAdapter:
             supports_json_schema=supports("--json-schema"),
             supports_max_budget_usd=supports("--max-budget-usd"),
             supports_effort=supports("--effort"),
+            supports_resume=supports("--resume") or supports("-r, --resume"),
         )
 
     def check_auth(self) -> dict:
@@ -265,6 +271,7 @@ class ClaudeCodeAdapter:
         run_id: str | None = None,
         on_event: Optional[Callable[[dict], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        resume_session_id: Optional[str] = None,
     ) -> tuple[RunHandle, Callable[[], RunResult]]:
         """Starts the CLI subprocess and returns (handle, wait_fn). Calling
         wait_fn() blocks (with the task's timeout) until the run finishes and
@@ -279,6 +286,13 @@ class ClaudeCodeAdapter:
         primitive (`user.interrupt` on a session thread), which this worker
         had no equivalent of: previously, once a task's subprocess started,
         nothing could stop it before its own timeout.
+
+        `resume_session_id`, if given, resumes that exact prior CLI session
+        (`--resume`) instead of starting a fresh one - `task.mission` becomes
+        the next conversational turn rather than a new task's instructions.
+        This is what makes a human's follow-up message a genuine continued
+        conversation: the agent still has full context of everything it did
+        in the session being resumed, not just a text digest of it.
         """
         run_id = run_id or str(uuid.uuid4())
         auth_status = self.check_auth()
@@ -303,6 +317,9 @@ class ClaudeCodeAdapter:
         args += ["--output-format", output_format]
         if output_format == "stream-json":
             args += ["--include-partial-messages", "--verbose"]
+
+        if resume_session_id and capabilities.supports_resume:
+            args += ["--resume", resume_session_id]
 
         if capabilities.supports_permission_mode:
             args += ["--permission-mode", self._permission_mode_for_risk(task.risk_level)]
@@ -353,6 +370,7 @@ class ClaudeCodeAdapter:
             result_summary = ""
             timed_out = False
             cost_usd: Optional[float] = None
+            cli_session_id: Optional[str] = resume_session_id
 
             # stdout is pumped by a background thread into a queue so the main
             # loop can honor the wall-clock deadline even when the CLI stalls
@@ -413,6 +431,8 @@ class ClaudeCodeAdapter:
                             result_summary = event.get("text", result_summary)
                         if event.get("kind") == "cost":
                             cost_usd = event.get("cost_usd")
+                        if event.get("kind") == "session_id":
+                            cli_session_id = event.get("session_id")
                         if on_event:
                             try:
                                 on_event(event)
@@ -492,6 +512,7 @@ class ClaudeCodeAdapter:
                 stderr_tail=stderr_output[-4000:],
                 tool_calls=tool_calls,
                 cost_usd=cost_usd,
+                cli_session_id=cli_session_id,
             )
 
         return handle, _wait
@@ -568,6 +589,14 @@ def _parse_stream_line(line: str) -> list[dict]:
         if isinstance(cost, (int, float)):
             events.append({"kind": "cost", "cost_usd": float(cost)})
         return events
+    if msg_type == "system" and obj.get("subtype") == "init":
+        # Captures the CLI's own session id so a later human reply can
+        # --resume this exact session (see start_run's resume_session_id)
+        # instead of starting a fresh, context-less run.
+        session_id = obj.get("session_id")
+        if session_id:
+            return [{"kind": "session_id", "session_id": session_id}]
+        return []
     if msg_type is None:
         return [{"kind": "other"}]
     return [{"kind": "other", "raw_type": msg_type}]

@@ -128,3 +128,38 @@ def test_real_task_fixes_failing_test_in_isolated_worktree():
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert branch_check == result.final_commit, "fix must survive worktree removal on the branch ref"
+
+
+def test_reply_resumes_the_real_cli_session_with_actual_conversational_memory():
+    """The whole point of the chat/reply feature: a second real CLI
+    invocation with resume_session_id set must genuinely remember the first
+    turn - not just re-send a text digest of it. Kept minimal (no workspace,
+    no tools) to spend as little real usage as possible while still proving
+    it against the actual CLI, not a mock."""
+    adapter = ClaudeCodeAdapter(cli_path="claude", workspace_root=REPO_ROOT / "workspace")
+
+    def _bare_contract(task_id: str, mission: str) -> TaskContract:
+        return TaskContract(
+            task_id=task_id, mission=mission, context="", constraints=[],
+            allowed_tools=[], prohibited_actions=[], acceptance_criteria=[],
+            output_schema=None, timeout_seconds=120, risk_level="R0",
+        )
+
+    task_id = f"e2e-resume-{uuid.uuid4().hex[:8]}"
+    secret_number = "471962"
+    first = _bare_contract(
+        task_id, f"Remember this number for later: {secret_number}. Reply with only the word 'ok'.",
+    )
+    handle, wait = adapter.start_run(first)
+    first_result = wait()
+    assert first_result.exit_code == 0, f"first turn failed: {first_result.stderr_tail}"
+    assert first_result.cli_session_id, "the CLI must report a session id on its init message"
+
+    second = _bare_contract(task_id, "What number did I just tell you? Reply with only the digits.")
+    handle2, wait2 = adapter.start_run(second, resume_session_id=first_result.cli_session_id)
+    second_result = wait2()
+
+    assert second_result.exit_code == 0, f"resumed turn failed: {second_result.stderr_tail}"
+    assert secret_number in second_result.result_summary, (
+        f"resumed session did not recall the number from the first turn - got: {second_result.result_summary!r}"
+    )

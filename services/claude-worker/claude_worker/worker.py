@@ -62,6 +62,29 @@ def _task_to_contract(task: Task) -> TaskContract:
     )
 
 
+def _reply_to_contract(task: Task, message_body: str) -> TaskContract:
+    """A follow-up turn in an existing conversation, not a new task: the
+    mission is the human's own message, not the original task description.
+    Reuses the task's own tool allow-list/risk level/workspace, since the
+    session being resumed already carries the original mission's full
+    context - restating it here would be redundant, and could actively
+    confuse a model mid-conversation."""
+    ac = task.acceptance_criteria or {}
+    return TaskContract(
+        task_id=str(task.id),
+        mission=message_body,
+        context=f"Follow-up message on task: {task.title}",
+        constraints=ac.get("constraints", []),
+        allowed_tools=ac.get("allowed_tools", ["Read", "Grep", "Glob", "Write", "Edit"]),
+        prohibited_actions=ac.get("prohibited_actions", []),
+        acceptance_criteria=[],
+        output_schema=None,
+        timeout_seconds=task.timeout_seconds,
+        risk_level=task.risk_level,
+        workspace_repo=task.workspace_repo,
+    )
+
+
 # The linear happy-path GoalState order (skipping the optional
 # APPROVAL_PENDING/PREVIEW_READY branches, which nothing in this codebase ever
 # enters) - used to walk a goal forward from wherever it currently sits once
@@ -204,6 +227,10 @@ def run_once(db, adapter: ClaudeCodeAdapter, agent_concurrency_limits: dict[str,
         ready = pick_ready_tasks(db, org_id, agent_concurrency_limits)
         for task in ready:
             executed += _execute_task(db, adapter, task)
+        # 3. Human follow-up messages awaiting a reply - resumes the task's
+        #    existing CLI session rather than starting a fresh task.
+        for task, message in _pending_reply_requests(db, org_id):
+            executed += _execute_reply(db, adapter, task, message)
     return executed
 
 
@@ -613,6 +640,7 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         run.baseline_commit = result.baseline_commit
         run.result_summary = result.result_summary
         run.cost_usd = result.cost_usd
+        run.cli_session_id = result.cli_session_id
         # Spend is real the moment the CLI reports it - a cancelled, timed-out,
         # or failed run can still have burned real tokens, so this is recorded
         # unconditionally rather than only on the success path.
@@ -687,6 +715,153 @@ def _execute_task(db, adapter: ClaudeCodeAdapter, task: Task) -> int:
         except Exception:  # noqa: BLE001
             pass
         _mark_task_recoverable(db, task, run, org_id, actor)
+        return 0
+    finally:
+        release_lease(db, task.id, worker_id=WORKER_ID)
+
+
+def _pending_reply_requests(db, org_id):
+    """Tasks whose most recent TaskMessage is a human message still awaiting
+    a reply. A task's most-recent message being role="human" IS the
+    "unanswered" condition - the worker always writes the agent's reply as
+    its own row right after producing it, so nothing but a fresh human
+    message can leave a task in this state. Skips any task with a currently
+    held RunLease (its original run, or an earlier reply, is still in
+    flight) so two poll ticks can never process the same conversation at
+    once."""
+    from sqlalchemy import and_, func
+
+    from app.models.work import RunLease, Task, TaskMessage
+
+    latest_ts = (
+        db.query(TaskMessage.task_id, func.max(TaskMessage.created_at).label("max_ts"))
+        .filter(TaskMessage.organization_id == org_id)
+        .group_by(TaskMessage.task_id)
+        .subquery()
+    )
+    pending_messages = (
+        db.query(TaskMessage)
+        .join(latest_ts, and_(TaskMessage.task_id == latest_ts.c.task_id, TaskMessage.created_at == latest_ts.c.max_ts))
+        .filter(TaskMessage.role == "human")
+        .all()
+    )
+    if not pending_messages:
+        return []
+    leased_task_ids = {row[0] for row in db.query(RunLease.task_id).all()}
+    out = []
+    for message in pending_messages:
+        if message.task_id in leased_task_ids:
+            continue
+        task = db.query(Task).filter(Task.id == message.task_id, Task.organization_id == org_id).first()
+        if task is not None:
+            out.append((task, message))
+    return out
+
+
+def _execute_reply(db, adapter: ClaudeCodeAdapter, task: Task, message) -> int:
+    """Processes one pending human TaskMessage as the next turn of the
+    task's existing CLI conversation (see _reply_to_contract and
+    cli_adapter.start_run's resume_session_id) - a real continued dialogue,
+    not a new one-shot task. Never touches task.state: a reply is a
+    conversation turn, not a step in the goal/task FSM."""
+    from app.models.work import Run, TaskMessage
+
+    org_id = task.organization_id
+    actor = task.assigned_agent_key or "claude-worker"
+
+    last_run = (
+        db.query(Run)
+        .filter(Run.task_id == task.id, Run.cli_session_id.isnot(None))
+        .order_by(Run.created_at.desc())
+        .first()
+    )
+    if last_run is None:
+        # No prior session to resume - the original run never captured one
+        # (e.g. an older run predating this feature, or it failed before the
+        # CLI ever emitted its init message). Nothing safe to do but skip;
+        # an operator has to re-run the original task first.
+        logger.warning("Task %s has a pending reply but no prior CLI session to resume - skipping", task.id)
+        return 0
+    resume_session_id = last_run.cli_session_id
+
+    run = Run(organization_id=org_id, task_id=task.id, agent_key=task.assigned_agent_key, state="running")
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    try:
+        acquire_lease(db, task.id, run.id, worker_id=WORKER_ID, ttl_seconds=task.timeout_seconds + 60)
+    except LeaseNotAcquired:
+        db.delete(run)
+        db.commit()
+        return 0
+
+    try:
+        blocking_budget, warned_budgets = _budget_gate(db, org_id, task.assigned_agent_key)
+        for wb in warned_budgets:
+            publish(
+                org_id, EventType.BUDGET_THRESHOLD_REACHED, actor, str(task.id),
+                payload={
+                    "scope": wb.scope, "scope_ref": wb.scope_ref,
+                    "spent_amount": float(wb.spent_amount), "monthly_max": float(wb.monthly_max),
+                    "warn_percent": float(wb.warn_percent),
+                },
+            )
+        db.commit()
+        if blocking_budget is not None:
+            run.state = "failed"
+            run.finished_at = datetime.now(timezone.utc)
+            db.add(run)
+            db.commit()
+            return 0
+
+        contract = _reply_to_contract(task, message.body)
+        tool_call_ids: dict[str, uuid.UUID] = {}
+        handle, wait = adapter.start_run(
+            contract,
+            run_id=str(run.id),
+            on_event=lambda ev: _forward_worker_event(org_id, task, run, ev, tool_call_ids, db.get_bind()),
+            is_cancelled=_make_is_cancelled(task.id, db.get_bind()),
+            resume_session_id=resume_session_id,
+        )
+        result = wait()
+
+        run.exit_code = result.exit_code
+        run.result_summary = result.result_summary
+        run.cost_usd = result.cost_usd
+        run.cli_session_id = result.cli_session_id or resume_session_id
+        run.finished_at = datetime.now(timezone.utc)
+        _commit_run_cost(db, org_id, task.assigned_agent_key, run.id, result.cost_usd)
+
+        if result.exit_code == 0 and not result.timed_out and not result.cancelled:
+            run.state = "completed"
+            reply_body = result.result_summary or "(the agent produced no textual reply)"
+        else:
+            run.state = "failed"
+            reply_body = f"(the agent failed to reply: exit={result.exit_code}, timed_out={result.timed_out})"
+        db.add(run)
+        db.add(TaskMessage(
+            organization_id=org_id, task_id=task.id, role="agent", body=reply_body,
+            run_id=run.id, created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        publish(
+            org_id, EventType.TASK_MESSAGE, actor, str(task.id),
+            payload={"role": "agent", "body": reply_body},
+            entities=_task_entities(task, run),
+        )
+        return 1
+    except Exception:  # noqa: BLE001 - never let one bad reply crash the poll tick
+        logger.exception("Unexpected error replying to task %s - leaving message unanswered for retry", task.id)
+        db.rollback()
+        try:
+            db.refresh(run)
+            run.state = "failed"
+            db.add(run)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
         return 0
     finally:
         release_lease(db, task.id, worker_id=WORKER_ID)

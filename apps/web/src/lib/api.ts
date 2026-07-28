@@ -265,6 +265,15 @@ export const plansApi = {
   list: () => api.get<unknown[]>("/plans"),
 };
 
+export interface TaskMessage {
+  id: string;
+  task_id: string;
+  role: "human" | "agent";
+  body: string;
+  run_id: string | null;
+  created_at: string;
+}
+
 export const tasksApi = {
   list: () => api.get<unknown[]>("/tasks"),
   // Interrupts a specific in-flight task. If it's genuinely RUNNING, the
@@ -276,6 +285,13 @@ export const tasksApi = {
       `/tasks/${id}/cancel`,
       { reason },
     ),
+  // A real, continued conversation with this task's agent: the worker
+  // resumes the task's actual CLI session (claude_worker.worker's
+  // _execute_reply) rather than starting a fresh, context-less task. 409
+  // means the task has no completed run yet - there's no session to resume.
+  listMessages: (id: string) => api.get<TaskMessage[]>(`/tasks/${id}/messages`),
+  sendMessage: (id: string, content: string) =>
+    api.post<TaskMessage>(`/tasks/${id}/messages`, { content }),
 };
 
 export const runsApi = {

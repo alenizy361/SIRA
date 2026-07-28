@@ -55,6 +55,13 @@ export function toTransmission(e: WireEvent): Transmission {
       return { tone: "success", verbEn: "finished the goal", verbAr: "أنجز الهدف بالكامل", detail: str(p.title) };
     case "task.cancelled":
       return { tone: "warning", verbEn: "was cancelled", verbAr: "أُلغيت مهمته", detail: str(p.title) };
+    case "task.message":
+      return {
+        tone: p.role === "human" ? "info" : "success",
+        verbEn: p.role === "human" ? "sent a message" : "replied",
+        verbAr: p.role === "human" ? "أرسل رسالة" : "ردّ",
+        detail: str(p.body),
+      };
     case "run.tool.started":
       return {
         tone: "active",

@@ -88,6 +88,12 @@ class Run(Base, OrgScopedMixin):
     # until the run finishes; a failed/timed-out run can still have incurred
     # real cost, so this is set independently of run.state.
     cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
+    # The CLI's own session id for this run (from stream-json's system/init
+    # message). A later human reply to this task resumes THIS exact session
+    # (claude_worker.cli_adapter's `--resume`) rather than starting a fresh,
+    # context-less run - what makes TaskMessage a real conversation instead
+    # of a new one-shot task each time.
+    cli_session_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
 
 class RunLease(Base):
@@ -179,4 +185,27 @@ class Cancellation(Base):
     run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=True)
     requested_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TaskMessage(Base):
+    """One turn of a real back-and-forth with a task's agent - a human
+    message picked up by claude_worker.worker's reply loop (see
+    _pending_reply_requests/_execute_reply), which resumes the SAME CLI
+    session (Run.cli_session_id) rather than starting a fresh, context-less
+    task. The agent's reply is its own row (role="agent"), linked to the Run
+    that produced it so a work log / cost can still be traced back to it.
+    Plain Base (like ToolCall/RunEvent/Cancellation) rather than
+    OrgScopedMixin - an append-only conversation log has no use for
+    soft-delete/status/created_by, and organization_id here is purely a
+    query-efficiency denormalization from task.organization_id."""
+
+    __tablename__ = "task_messages"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # "human" | "agent"
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -17,6 +17,7 @@ class _FakeRunResult:
         self.timed_out = False
         self.cancelled = False
         self.cost_usd = None
+        self.cli_session_id = None
         self.workspace_path = "/tmp/fake"
         self.branch_name = "agent/fake"
         self.baseline_commit = "abc123"
@@ -25,7 +26,7 @@ class _FakeRunResult:
         self.changed_files = ["src/funnel/step3.py"]
 
 
-def _fake_start_run_emitting_events(self, contract, run_id=None, on_event=None, is_cancelled=None):
+def _fake_start_run_emitting_events(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
     class _Handle:
         cancelled = False
 
@@ -114,7 +115,7 @@ def test_task_execution_publishes_real_events_over_redis_pubsub(db, org_id, monk
     assert len(set(sequences)) == len(sequences)
 
 
-def _fake_start_run_with_correlated_tool_call(self, contract, run_id=None, on_event=None, is_cancelled=None):
+def _fake_start_run_with_correlated_tool_call(self, contract, run_id=None, on_event=None, is_cancelled=None, resume_session_id=None):
     class _Handle:
         cancelled = False
 
