@@ -9,6 +9,7 @@ import { goalsApi } from "@/lib/api";
 import { GOAL_TRANSITIONS } from "@/lib/goalStates";
 import { ErrorState } from "@/components/EmptyState";
 import { SpeakButton } from "@/components/SpeakButton";
+import { GoalPlanPanel } from "@/components/GoalPlanPanel";
 
 export default function GoalDetailPage({
   params,
@@ -77,6 +78,11 @@ export default function GoalDetailPage({
             <dd>{new Date(goal.created_at).toLocaleString()}</dd>
           </div>
         </dl>
+      </div>
+
+      {/* The CEO's response: plan summary + tasks (the durable answer). */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+        <GoalPlanPanel goalId={id} showOpenLink={false} />
       </div>
 
       <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">

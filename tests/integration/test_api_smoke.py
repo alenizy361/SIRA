@@ -170,3 +170,70 @@ def test_full_onboarding_login_goal_approval_flow(client):
 
     client.post("/auth/logout")
     assert client.get("/auth/me").status_code == 401
+
+
+def test_goal_plan_endpoint_returns_ceo_response(client):
+    """The dashboard reads /goals/{id}/plan to SHOW the CEO's answer. It must
+    report 'no plan yet' honestly before planning, then return the plan summary
+    and its tasks once they exist - this is the durable response the operator
+    sees instead of a silent nothing."""
+    import uuid as _uuid
+
+    from app.db import get_sessionmaker
+    from app.models.company import Goal
+    from app.models.identity import Organization
+    from app.models.work import Plan, Task
+
+    # Org already onboarded by the prior test; log back in.
+    login = client.post("/auth/login", json={"email": "smoke@rabit.sa", "password": "correct-horse-battery-staple"})
+    assert login.status_code == 200, login.text
+
+    goal = client.post(
+        "/goals",
+        json={"title": "Ship the landing page", "description": "A fast Arabic landing page."},
+    ).json()
+    goal_id = goal["id"]
+
+    # No plan yet -> honest empty response, not a 404 or fake data.
+    empty = client.get(f"/goals/{goal_id}/plan")
+    assert empty.status_code == 200, empty.text
+    body = empty.json()
+    assert body["plan"] is None
+    assert body["tasks"] == []
+
+    # Insert a real Plan + Task the way planning.py would, then read it back.
+    SessionLocal = get_sessionmaker()
+    db = SessionLocal()
+    org_id = db.query(Organization.id).scalar()
+    plan = Plan(
+        organization_id=org_id,
+        goal_id=_uuid.UUID(goal_id),
+        title="Landing page delivery",
+        summary="Build a responsive Arabic-first landing page and verify it on mobile.",
+        state="drafted",
+    )
+    db.add(plan)
+    db.flush()
+    db.add(
+        Task(
+            organization_id=org_id,
+            plan_id=plan.id,
+            title="Build the hero section",
+            description="Implement the hero with the primary call to action.",
+            assigned_agent_key="frontend_engineer",
+            risk_level="R1",
+            state="ready",
+            idempotency_key=f"{goal_id}-plan-{plan.id}-0",
+            acceptance_criteria={"criteria": [], "allowed_tools": ["Read", "Edit"]},
+        )
+    )
+    db.commit()
+    db.close()
+
+    resp = client.get(f"/goals/{goal_id}/plan").json()
+    assert resp["plan"]["summary"].startswith("Build a responsive Arabic-first")
+    assert len(resp["tasks"]) == 1
+    task = resp["tasks"][0]
+    assert task["agent_key"] == "frontend_engineer"
+    assert task["risk_level"] == "R1"
+    assert task["title"] == "Build the hero section"

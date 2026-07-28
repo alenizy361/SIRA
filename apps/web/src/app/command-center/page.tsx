@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tan
 import { useI18n } from "@/i18n/I18nProvider";
 import { useToast } from "@/components/ToastProvider";
 import { NeuralCommandBoard } from "@/components/NeuralCommandBoard";
+import { GoalPlanPanel } from "@/components/GoalPlanPanel";
 import { VoiceCapture } from "@/components/VoiceCapture";
 import { SpeakButton } from "@/components/SpeakButton";
 import { useEventStore, type WireEvent } from "@/store/eventStore";
@@ -166,6 +167,9 @@ export default function CommandCenterPage() {
   const queryClient = useQueryClient();
   const [goalTitle, setGoalTitle] = useState("");
   const [confirmingStop, setConfirmingStop] = useState(false);
+  // The goal whose CEO response we're showing. Set the moment you Send; falls
+  // back to the most recent goal so a reload still shows the last answer.
+  const [sentGoalId, setSentGoalId] = useState<string | null>(null);
 
   const coreState = useEventStore((s) => s.coreState);
   const wsStatus = useEventStore((s) => s.wsStatus);
@@ -210,7 +214,10 @@ export default function CommandCenterPage() {
       toast.show(t("command_center.goal_created"), "success");
       setGoalTitle("");
       queryClient.invalidateQueries({ queryKey: ["goals"] });
-      if (goal?.id) requestPlan.mutate(goal.id);
+      if (goal?.id) {
+        setSentGoalId(goal.id); // show the CEO response panel for this goal
+        requestPlan.mutate(goal.id);
+      }
     },
     onError: () => toast.show(t("common.error_generic"), "error"),
   });
@@ -241,6 +248,10 @@ export default function CommandCenterPage() {
     (g) => g.state === "goal_captured"
   );
   const pendingApprovals = approvalsQuery.data ?? [];
+
+  // Which goal's CEO response to show: the one you just sent, else the most
+  // recent goal (list is created_at desc) so the last answer is always here.
+  const activeGoalId = sentGoalId ?? (goalsQuery.data ?? [])[0]?.id ?? null;
 
   // Real activity gauge: events that landed in the last 60s.
   const eventsPerMin = useMemo(() => {
@@ -282,6 +293,14 @@ export default function CommandCenterPage() {
           going to happen when I send a command?". Reads the host worker's
           heartbeat: running / asleep (not logged in) / down. */}
       <WorkerBanner query={workerQuery} />
+
+      {/* The CEO's response to your last command - the readable answer, right
+          where you'd look for it. Shows "planning now" then the plan + tasks. */}
+      {activeGoalId ? (
+        <section className="glass rounded-2xl p-4">
+          <GoalPlanPanel goalId={activeGoalId} />
+        </section>
+      ) : null}
 
       {/* three-column neural layout */}
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[250px_minmax(0,1fr)_300px]">

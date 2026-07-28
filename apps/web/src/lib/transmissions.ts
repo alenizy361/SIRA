@@ -28,8 +28,12 @@ export function toTransmission(e: WireEvent): Transmission {
         verbAr: p.plan_status === "requested" ? "طُلب منه التخطيط" : "التقط هدفاً",
         detail: str(p.title),
       };
-    case "plan.created":
-      return { tone: "success", verbEn: "drafted a plan", verbAr: "صاغ خطة", detail: str(p.title) };
+    case "plan.created": {
+      // Prefer the CEO's own worded summary so the feed reads like a reply,
+      // not a label. Fall back to the plan title.
+      const detail = str(p.summary).trim() || str(p.title).trim();
+      return { tone: "success", verbEn: "drafted a plan", verbAr: "صاغ خطة", detail };
+    }
     case "task.created":
       return {
         tone: "info",

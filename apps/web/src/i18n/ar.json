@@ -103,7 +103,14 @@
     "worker_asleep_hint": "على الخادم شغّل: sudo -u aicompany -H claude auth login",
     "worker_down": "مُشغّل الشركة متوقف — لن يحدث أي تفاعل",
     "worker_down_hint": "على الخادم شغّل: systemctl restart rabit-claude-worker.service",
-    "worker_checking": "جارٍ فحص حالة الشركة…"
+    "worker_checking": "جارٍ فحص حالة الشركة…",
+    "ceo_response": "ردّ الرئيس التنفيذي",
+    "ceo_planning_now": "الرئيس التنفيذي يخطّط الآن…",
+    "ceo_planning_wait": "قد يستغرق هذا نحو دقيقة. ستظهر الخطة والمهام هنا فور جاهزيتها.",
+    "plan_tasks": "المهام",
+    "no_plan_yet": "لم يُطلب التخطيط لهذا الهدف بعد.",
+    "open_goal": "افتح الهدف كاملاً",
+    "assigned_to": "المسؤول"
   },
   "goals": {
     "title": "الأهداف",

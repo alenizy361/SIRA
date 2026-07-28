@@ -161,6 +161,27 @@ export const agentsApi = {
   list: () => api.get<Agent[]>("/agents"),
 };
 
+export interface PlanTask {
+  id: string;
+  title: string;
+  description: string;
+  agent_key: string | null;
+  risk_level: string;
+  state: string;
+}
+
+export interface GoalPlan {
+  plan: {
+    id: string;
+    title: string;
+    summary: string;
+    state: string;
+  } | null;
+  tasks: PlanTask[];
+  /** "requested" | "running" | null - from the goal's metadata. */
+  plan_status: string | null;
+}
+
 export const goalsApi = {
   list: () => api.get<Goal[]>("/goals"),
   get: (id: string) => api.get<Goal>(`/goals/${id}`),
@@ -172,6 +193,8 @@ export const goalsApi = {
   // tasks appear asynchronously via the goal state and the event stream.
   requestPlan: (id: string) =>
     api.post<{ plan_status: string }>(`/goals/${id}/plan`, {}),
+  // The durable "response": the CEO's plan (title + summary) and its tasks.
+  getPlan: (id: string) => api.get<GoalPlan>(`/goals/${id}/plan`),
 };
 
 export const approvalsApi = {

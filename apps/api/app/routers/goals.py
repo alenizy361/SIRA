@@ -192,6 +192,60 @@ def request_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db:
     return {"goal": _goal_out(goal), "plan_status": "requested"}
 
 
+@router.get("/{goal_id}/plan")
+def get_goal_plan(goal_id: uuid.UUID, user: User = Depends(get_current_user), db: DbSession = Depends(get_db)):
+    """The durable 'response' to a goal: the CEO's plan (title + summary) and
+    the tasks it produced, each with its assigned agent, risk and live state.
+    This is what the dashboard reads to SHOW the answer - the WS event stream
+    is only the live narration; this endpoint is the record that survives a
+    reload and tells the operator plainly what the company decided to do."""
+    from app.models.work import Plan, Task
+
+    goal = db.get(Goal, goal_id)
+    if not goal or goal.organization_id != user.organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found")
+
+    meta = dict(goal.metadata_json or {})
+    plan = (
+        db.query(Plan)
+        .filter(Plan.goal_id == goal.id)
+        .order_by(Plan.created_at.desc())
+        .first()
+    )
+    if not plan:
+        # No plan yet - tell the UI whether the CEO is actively working
+        # (requested/running) or was never asked, so it shows the right state
+        # instead of a bare "nothing here".
+        return {"plan": None, "tasks": [], "plan_status": meta.get("plan_status")}
+
+    tasks = (
+        db.query(Task)
+        .filter(Task.plan_id == plan.id)
+        .order_by(Task.created_at.asc())
+        .all()
+    )
+    return {
+        "plan": {
+            "id": str(plan.id),
+            "title": plan.title,
+            "summary": plan.summary or "",
+            "state": plan.state,
+        },
+        "tasks": [
+            {
+                "id": str(t.id),
+                "title": t.title,
+                "description": t.description,
+                "agent_key": t.assigned_agent_key,
+                "risk_level": t.risk_level,
+                "state": t.state,
+            }
+            for t in tasks
+        ],
+        "plan_status": meta.get("plan_status"),
+    }
+
+
 def _goal_out(goal: Goal) -> dict:
     return {
         "id": str(goal.id),

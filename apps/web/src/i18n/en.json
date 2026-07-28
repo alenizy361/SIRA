@@ -103,7 +103,14 @@
     "worker_asleep_hint": "On the server run: sudo -u aicompany -H claude auth login",
     "worker_down": "The company worker is down — nothing will react",
     "worker_down_hint": "On the server run: systemctl restart rabit-claude-worker.service",
-    "worker_checking": "Checking company status…"
+    "worker_checking": "Checking company status…",
+    "ceo_response": "CEO response",
+    "ceo_planning_now": "The CEO is planning now…",
+    "ceo_planning_wait": "This can take about a minute. The plan and tasks will appear here as soon as they're ready.",
+    "plan_tasks": "Tasks",
+    "no_plan_yet": "Planning hasn't been requested for this goal yet.",
+    "open_goal": "Open the full goal",
+    "assigned_to": "Assigned to"
   },
   "goals": {
     "title": "Goals",

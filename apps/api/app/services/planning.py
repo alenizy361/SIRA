@@ -182,6 +182,22 @@ def plan_goal(db, goal: Goal) -> Plan:
     db.commit()
     db.refresh(plan)
 
+    # Announce the CEO's actual answer FIRST: title + the one-paragraph summary.
+    # Without this the live feed only ever shows "created a task X" and the
+    # operator never sees the CEO explain, in words, what it decided to do.
+    publish(
+        goal.organization_id, EventType.PLAN_CREATED, "ceo", str(plan.id),
+        payload={
+            "title": plan.title,
+            "summary": plan.summary or "",
+            "task_count": len(created_tasks),
+        },
+        entities=[
+            EntityRef(type="goal", id=str(goal.id)),
+            EntityRef(type="plan", id=str(plan.id)),
+        ],
+    )
+
     for task_row in created_tasks:
         db.refresh(task_row)
         publish(

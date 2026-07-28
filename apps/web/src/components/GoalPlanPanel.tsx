@@ -1,0 +1,155 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import Link from "next/link";
+import { useI18n } from "@/i18n/I18nProvider";
+import { goalsApi } from "@/lib/api";
+import { agentMeta } from "@/lib/agentMeta";
+
+const RISK_COLOR: Record<string, string> = {
+  R0: "#34d399",
+  R1: "#fbbf24",
+  R2: "#fb7185",
+};
+
+/**
+ * The readable "response" to a goal: the CEO's plan summary and the tasks it
+ * created, each tagged with its agent and risk. This is the durable answer -
+ * it reads the /goals/{id}/plan record, so it survives reloads and doesn't
+ * depend on catching the live WS stream at the right moment.
+ *
+ * While the CEO is still planning (no plan row yet, plan_status
+ * requested/running) it polls every few seconds and shows a "planning now"
+ * state, so the operator always knows something IS happening.
+ */
+export function GoalPlanPanel({
+  goalId,
+  showOpenLink = true,
+}: {
+  goalId: string;
+  showOpenLink?: boolean;
+}) {
+  const { t, locale } = useI18n();
+
+  const TERMINAL = ["completed", "cancelled", "failed", "incident_opened"];
+  const planQuery = useQuery({
+    queryKey: ["goal-plan", goalId],
+    queryFn: () => goalsApi.getPlan(goalId),
+    // Poll fast while the CEO is planning; keep polling (slower) while any task
+    // is still running so their states update; stop once everything is done.
+    refetchInterval: (query) => {
+      const d = query.state.data;
+      if (!d?.plan) return 4_000;
+      const allDone = d.tasks.length > 0 && d.tasks.every((t) => TERMINAL.includes(t.state));
+      return allDone ? false : 8_000;
+    },
+  });
+
+  const data = planQuery.data;
+  const planning =
+    !data?.plan && (data?.plan_status === "requested" || data?.plan_status === "running");
+
+  if (planQuery.isLoading) {
+    return <p className="py-4 text-center text-sm text-slate-500">{t("common.loading")}</p>;
+  }
+
+  // CEO still working - honest "planning now" state with a live pulse.
+  if (planning) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-6 text-center">
+        <div className="flex items-center gap-1.5">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-violet-400 shadow-[0_0_10px_#a78bfa]" />
+          <span className="text-sm font-semibold text-violet-200">{t("command_center.ceo_planning_now")}</span>
+        </div>
+        <p className="max-w-[36ch] text-xs text-slate-500">{t("command_center.ceo_planning_wait")}</p>
+      </div>
+    );
+  }
+
+  if (!data?.plan) {
+    return <p className="py-4 text-center text-sm text-slate-500">{t("command_center.no_plan_yet")}</p>;
+  }
+
+  const { plan, tasks } = data;
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* The CEO's worded answer */}
+      <div className="rounded-2xl border border-violet-400/25 bg-violet-500/[0.06] p-3">
+        <div className="mb-1 flex items-center gap-2">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full border border-violet-400/50 bg-violet-500/20 text-[9px] font-bold text-violet-100">
+            CEO
+          </span>
+          <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-violet-300">
+            {t("command_center.ceo_response")}
+          </span>
+        </div>
+        <p className="text-sm font-semibold text-slate-100">{plan.title}</p>
+        {plan.summary ? (
+          <p className="mt-1 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-slate-300">
+            {plan.summary}
+          </p>
+        ) : null}
+      </div>
+
+      {/* The tasks it handed out */}
+      {tasks.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">
+            {t("command_center.plan_tasks")} · {tasks.length}
+          </span>
+          {tasks.map((task, i) => {
+            const meta = agentMeta(task.agent_key || "");
+            const risk = RISK_COLOR[task.risk_level] || "#94a3b8";
+            return (
+              <div
+                key={task.id}
+                className="rounded-xl border border-white/8 bg-white/[0.02] p-3"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs tabular-nums text-slate-600">{i + 1}.</span>
+                    <span className="text-sm font-medium text-slate-100">{task.title}</span>
+                  </div>
+                  <span
+                    className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
+                    style={{ color: risk, background: `${risk}1a`, border: `1px solid ${risk}44` }}
+                  >
+                    {task.risk_level}
+                  </span>
+                </div>
+                {task.description ? (
+                  <p className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-relaxed text-slate-400">
+                    {task.description}
+                  </p>
+                ) : null}
+                <div className="mt-2 flex items-center gap-2">
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                    style={{ color: meta.color, background: `${meta.color}14`, border: `1px solid ${meta.color}33` }}
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full" style={{ background: meta.color }} aria-hidden />
+                    {t("command_center.assigned_to")}: {task.agent_key || "—"}
+                  </span>
+                  <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-slate-400">
+                    {task.state}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+
+      {showOpenLink ? (
+        <Link
+          href={`/goals/${goalId}`}
+          className="text-xs text-emerald-300 hover:text-emerald-200"
+          lang={locale}
+        >
+          {t("command_center.open_goal")} →
+        </Link>
+      ) : null}
+    </div>
+  );
+}
