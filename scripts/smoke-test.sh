@@ -38,12 +38,23 @@ FAILURES=0
 
 check_http() {
   local name="$1" url="$2"
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" || echo 000)"
+  local code attempt
+  # A freshly (re)started container/systemd unit is not instantly ready -
+  # Type=simple systemd units are marked "active" the moment the process is
+  # forked, well before Uvicorn/Next.js has actually bound its port. A
+  # single one-shot check right after install.sh starts these units races
+  # that startup and fails even on a perfectly healthy deploy (seen on a
+  # real VPS: nginx finished configuring the same second the smoke test
+  # started). Retry for up to ~30s before giving up for real.
+  for attempt in $(seq 1 15); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" || echo 000)"
+    [[ "$code" == "200" ]] && break
+    sleep 2
+  done
   if [[ "$code" == "200" ]]; then
     log_ok "${name}: ${url} -> HTTP ${code}"
   else
-    log_error "${name}: ${url} -> HTTP ${code} (expected 200)"
+    log_error "${name}: ${url} -> HTTP ${code} (expected 200, gave up after ~30s of retries)"
     FAILURES=$((FAILURES + 1))
     return 1
   fi
