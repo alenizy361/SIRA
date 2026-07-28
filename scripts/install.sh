@@ -399,6 +399,23 @@ configure_nginx() {
   log_step "Configuring Nginx (DOMAIN=${domain})"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
   DOMAIN="$domain" envsubst '${DOMAIN}' < "$template" > /etc/nginx/sites-available/rabit-os.conf
+
+  if [[ "$domain" == "_" ]]; then
+    # No real domain configured: this server block is meant to catch bare-IP
+    # requests. Without an explicit `default_server`, nginx silently falls
+    # back to whichever OTHER site on this box happens to sort first when
+    # more than one vhost is present - on a VPS that already hosts other
+    # sites (a real, common case, not hypothetical), that means visiting
+    # the server's IP could route to a pre-existing site instead of this
+    # dashboard. Mark it explicitly rather than relying on nginx's implicit
+    # "first one wins" behavior.
+    sed -i \
+      -e 's/^\( *listen 80\);/\1 default_server;/' \
+      -e 's/^\( *listen \[::\]:80\);/\1 default_server;/' \
+      /etc/nginx/sites-available/rabit-os.conf
+    log_info "No DOMAIN set - marked rabit-os.conf as the default_server for port 80/[::]:80"
+  fi
+
   ln -sf /etc/nginx/sites-available/rabit-os.conf /etc/nginx/sites-enabled/rabit-os.conf
 
   if nginx -t; then
